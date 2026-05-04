@@ -227,4 +227,72 @@ class KafkaConsumerTest {
 
         verify(mockKafkaClient, org.mockito.Mockito.times(1)).close();
     }
+
+    @Test
+    void acknowledge_outOfOrderDoesNotRegressCommit() {
+        consumer.connect();
+        TopicPartition tp = new TopicPartition("topic-a", 0);
+        ConsumerRecord<byte[], byte[]> r41 = new ConsumerRecord<>("topic-a", 0, 41L, null, "a".getBytes());
+        ConsumerRecord<byte[], byte[]> r42 = new ConsumerRecord<>("topic-a", 0, 42L, null, "b".getBytes());
+        when(mockKafkaClient.poll(any(Duration.class)))
+                .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r41, r42))));
+
+        List<Message> messages = consumer.poll(Duration.ofMillis(10));
+        Message m41 = messages.get(0);
+        Message m42 = messages.get(1);
+
+        // Ack the later offset first; nothing should be committed yet because
+        // 41 is still in flight.
+        consumer.acknowledge(m42);
+        verify(mockKafkaClient, never()).commitSync(any(Map.class));
+
+        // Ack the earlier offset; the watermark advances past both records, so
+        // a single commit lands at offset 43 — never at 42 (which would regress).
+        consumer.acknowledge(m41);
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(43L))));
+        verify(mockKafkaClient, org.mockito.Mockito.times(1)).commitSync(any(Map.class));
+    }
+
+    @Test
+    void acknowledge_gapDoesNotSkipUnacked() {
+        consumer.connect();
+        TopicPartition tp = new TopicPartition("topic-a", 0);
+        ConsumerRecord<byte[], byte[]> r43 = new ConsumerRecord<>("topic-a", 0, 43L, null, "a".getBytes());
+        ConsumerRecord<byte[], byte[]> r44 = new ConsumerRecord<>("topic-a", 0, 44L, null, "b".getBytes());
+        ConsumerRecord<byte[], byte[]> r45 = new ConsumerRecord<>("topic-a", 0, 45L, null, "c".getBytes());
+        when(mockKafkaClient.poll(any(Duration.class)))
+                .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r43, r44, r45))));
+
+        List<Message> messages = consumer.poll(Duration.ofMillis(10));
+        Message m43 = messages.get(0);
+        Message m44 = messages.get(1);
+        Message m45 = messages.get(2);
+
+        consumer.acknowledge(m45);
+        verify(mockKafkaClient, never()).commitSync(any(Map.class));
+
+        consumer.acknowledge(m43);
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(44L))));
+
+        consumer.acknowledge(m44);
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(46L))));
+        verify(mockKafkaClient, org.mockito.Mockito.times(2)).commitSync(any(Map.class));
+    }
+
+    @Test
+    void acknowledge_inOrderCommitsAfterEachAck() {
+        consumer.connect();
+        TopicPartition tp = new TopicPartition("topic-a", 0);
+        ConsumerRecord<byte[], byte[]> r10 = new ConsumerRecord<>("topic-a", 0, 10L, null, "a".getBytes());
+        ConsumerRecord<byte[], byte[]> r11 = new ConsumerRecord<>("topic-a", 0, 11L, null, "b".getBytes());
+        when(mockKafkaClient.poll(any(Duration.class)))
+                .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r10, r11))));
+
+        List<Message> messages = consumer.poll(Duration.ofMillis(10));
+        consumer.acknowledge(messages.get(0));
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(11L))));
+
+        consumer.acknowledge(messages.get(1));
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(12L))));
+    }
 }

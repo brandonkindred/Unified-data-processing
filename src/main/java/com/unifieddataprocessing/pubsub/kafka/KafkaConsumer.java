@@ -19,9 +19,11 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Function;
 
 /**
@@ -36,6 +38,10 @@ public class KafkaConsumer implements PubSubConsumer {
     private final Set<String> subscribedTopics = new LinkedHashSet<>();
     private final Map<String, TopicPartition> partitionByMessageId = new HashMap<>();
     private final Map<String, Long> offsetByMessageId = new HashMap<>();
+    // Watermark tracking so out-of-order acks never cause the committed offset
+    // to regress or skip past unacked records on the same partition.
+    private final Map<TopicPartition, Long> lowestUnackedByPartition = new HashMap<>();
+    private final Map<TopicPartition, NavigableSet<Long>> ackedOffsetsByPartition = new HashMap<>();
 
     private Consumer<byte[], byte[]> consumer;
 
@@ -101,8 +107,10 @@ public class KafkaConsumer implements PubSubConsumer {
                     h.value() == null ? "" : new String(h.value(), StandardCharsets.UTF_8)));
             byte[] payload = record.value() == null ? new byte[0] : record.value();
             Message message = new Message(id, record.topic(), payload, attributes);
-            partitionByMessageId.put(id, new TopicPartition(record.topic(), record.partition()));
+            TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+            partitionByMessageId.put(id, tp);
             offsetByMessageId.put(id, record.offset());
+            lowestUnackedByPartition.merge(tp, record.offset(), Math::min);
             result.add(message);
         }
         return result;
@@ -118,9 +126,24 @@ public class KafkaConsumer implements PubSubConsumer {
             throw new IllegalStateException(
                     "Unknown message: " + message.getId() + ". Only messages returned by poll() can be acknowledged.");
         }
-        Map<TopicPartition, OffsetAndMetadata> commits = Collections.singletonMap(
-                tp, new OffsetAndMetadata(offset + 1));
-        consumer.commitSync(commits);
+
+        // Walk the contiguous prefix of acked offsets on this partition starting
+        // from the lowest unacked. We only commit when that watermark advances,
+        // which prevents both regression (committing a lower offset than already
+        // committed) and gap-skipping (committing past offsets still in flight).
+        NavigableSet<Long> acked = ackedOffsetsByPartition.computeIfAbsent(tp, k -> new TreeSet<>());
+        acked.add(offset);
+        long previousLowest = lowestUnackedByPartition.get(tp);
+        long lowest = previousLowest;
+        while (acked.remove(lowest)) {
+            lowest++;
+        }
+        lowestUnackedByPartition.put(tp, lowest);
+
+        if (lowest > previousLowest) {
+            consumer.commitSync(Collections.singletonMap(tp, new OffsetAndMetadata(lowest)));
+        }
+
         partitionByMessageId.remove(message.getId());
         offsetByMessageId.remove(message.getId());
     }
@@ -137,6 +160,8 @@ public class KafkaConsumer implements PubSubConsumer {
             subscribedTopics.clear();
             partitionByMessageId.clear();
             offsetByMessageId.clear();
+            lowestUnackedByPartition.clear();
+            ackedOffsetsByPartition.clear();
         }
     }
 
