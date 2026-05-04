@@ -308,6 +308,51 @@ class KafkaConsumerTest {
     }
 
     @Test
+    void acknowledge_offsetGapsDoNotBlockWatermark() {
+        consumer.connect();
+        TopicPartition tp = new TopicPartition("topic-a", 0);
+        // Compacted/transactional topic: offsets 101, 103, 104 don't reach the
+        // consumer (compaction holes or control records). Delivered: 100, 102, 105.
+        ConsumerRecord<byte[], byte[]> r100 = new ConsumerRecord<>("topic-a", 0, 100L, null, "a".getBytes());
+        ConsumerRecord<byte[], byte[]> r102 = new ConsumerRecord<>("topic-a", 0, 102L, null, "b".getBytes());
+        ConsumerRecord<byte[], byte[]> r105 = new ConsumerRecord<>("topic-a", 0, 105L, null, "c".getBytes());
+        when(mockKafkaClient.poll(any(Duration.class)))
+                .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r100, r102, r105))));
+
+        List<Message> messages = consumer.poll(Duration.ofMillis(10));
+        consumer.acknowledge(messages.get(0));
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(101L))));
+        consumer.acknowledge(messages.get(1));
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(103L))));
+        consumer.acknowledge(messages.get(2));
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(106L))));
+    }
+
+    @Test
+    void acknowledge_offsetGapsWithOutOfOrderAcks() {
+        consumer.connect();
+        TopicPartition tp = new TopicPartition("topic-a", 0);
+        ConsumerRecord<byte[], byte[]> r100 = new ConsumerRecord<>("topic-a", 0, 100L, null, "a".getBytes());
+        ConsumerRecord<byte[], byte[]> r102 = new ConsumerRecord<>("topic-a", 0, 102L, null, "b".getBytes());
+        ConsumerRecord<byte[], byte[]> r105 = new ConsumerRecord<>("topic-a", 0, 105L, null, "c".getBytes());
+        when(mockKafkaClient.poll(any(Duration.class)))
+                .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r100, r102, r105))));
+
+        List<Message> messages = consumer.poll(Duration.ofMillis(10));
+
+        // Ack 102 and 105 first; 100 is still in flight, so neither commit fires.
+        consumer.acknowledge(messages.get(1));
+        consumer.acknowledge(messages.get(2));
+        verify(mockKafkaClient, never()).commitSync(any(Map.class));
+
+        // Ack 100 — watermark advances over the entire delivered prefix
+        // (100, 102, 105) and commits 106 in a single call.
+        consumer.acknowledge(messages.get(0));
+        verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(106L))));
+        verify(mockKafkaClient, org.mockito.Mockito.times(1)).commitSync(any(Map.class));
+    }
+
+    @Test
     void acknowledge_inOrderCommitsAfterEachAck() {
         consumer.connect();
         TopicPartition tp = new TopicPartition("topic-a", 0);

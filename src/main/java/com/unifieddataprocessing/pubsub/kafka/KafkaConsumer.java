@@ -38,9 +38,12 @@ public class KafkaConsumer implements PubSubConsumer {
     private final Set<String> subscribedTopics = new LinkedHashSet<>();
     private final Map<String, TopicPartition> partitionByMessageId = new HashMap<>();
     private final Map<String, Long> offsetByMessageId = new HashMap<>();
-    // Watermark tracking so out-of-order acks never cause the committed offset
-    // to regress or skip past unacked records on the same partition.
-    private final Map<TopicPartition, Long> lowestUnackedByPartition = new HashMap<>();
+    // Per-partition watermark state. We track the actual delivered offsets
+    // (rather than walking the integers between min and max) because Kafka
+    // offsets can have legitimate gaps — compacted topics drop tombstones,
+    // transactional topics consume offsets for control records, etc. Walking
+    // delivered offsets makes the ack watermark gap-tolerant.
+    private final Map<TopicPartition, NavigableSet<Long>> deliveredOffsetsByPartition = new HashMap<>();
     private final Map<TopicPartition, NavigableSet<Long>> ackedOffsetsByPartition = new HashMap<>();
 
     private Consumer<byte[], byte[]> consumer;
@@ -110,7 +113,7 @@ public class KafkaConsumer implements PubSubConsumer {
             TopicPartition tp = new TopicPartition(record.topic(), record.partition());
             partitionByMessageId.put(id, tp);
             offsetByMessageId.put(id, record.offset());
-            lowestUnackedByPartition.merge(tp, record.offset(), Math::min);
+            deliveredOffsetsByPartition.computeIfAbsent(tp, k -> new TreeSet<>()).add(record.offset());
             result.add(message);
         }
         return result;
@@ -127,27 +130,30 @@ public class KafkaConsumer implements PubSubConsumer {
                     "Unknown message: " + message.getId() + ". Only messages returned by poll() can be acknowledged.");
         }
 
-        // Walk the contiguous prefix of acked offsets on this partition starting
-        // from the lowest unacked. We only commit when that watermark advances,
-        // which prevents both regression (committing a lower offset than already
-        // committed) and gap-skipping (committing past offsets still in flight).
-        // The watermark and the acked-set are mutated only after commitSync
-        // returns successfully — if commitSync throws, the caller can retry
-        // acknowledge(message) and the same commit will be re-attempted.
+        // Find the longest fully-acked prefix of *delivered* offsets on this
+        // partition. Walking delivered offsets (instead of integer-stepping)
+        // tolerates legitimate offset gaps from compaction or transactional
+        // control records. We only commit when the prefix advances; on commit
+        // success we drain the prefix from both delivered and acked, so a
+        // commitSync failure leaves all state intact for retry.
+        NavigableSet<Long> delivered = deliveredOffsetsByPartition.computeIfAbsent(tp, k -> new TreeSet<>());
         NavigableSet<Long> acked = ackedOffsetsByPartition.computeIfAbsent(tp, k -> new TreeSet<>());
         acked.add(offset);
-        long previousLowest = lowestUnackedByPartition.get(tp);
-        long candidateLowest = previousLowest;
-        while (acked.contains(candidateLowest)) {
-            candidateLowest++;
+
+        Long highestAckedDelivered = null;
+        for (Long delivOff : delivered) {
+            if (acked.contains(delivOff)) {
+                highestAckedDelivered = delivOff;
+            } else {
+                break;
+            }
         }
 
-        if (candidateLowest > previousLowest) {
-            consumer.commitSync(Collections.singletonMap(tp, new OffsetAndMetadata(candidateLowest)));
-            for (long o = previousLowest; o < candidateLowest; o++) {
-                acked.remove(o);
-            }
-            lowestUnackedByPartition.put(tp, candidateLowest);
+        if (highestAckedDelivered != null) {
+            long commitOffset = highestAckedDelivered + 1;
+            consumer.commitSync(Collections.singletonMap(tp, new OffsetAndMetadata(commitOffset)));
+            delivered.headSet(highestAckedDelivered, true).clear();
+            acked.headSet(highestAckedDelivered, true).clear();
         }
 
         partitionByMessageId.remove(message.getId());
@@ -166,7 +172,7 @@ public class KafkaConsumer implements PubSubConsumer {
             subscribedTopics.clear();
             partitionByMessageId.clear();
             offsetByMessageId.clear();
-            lowestUnackedByPartition.clear();
+            deliveredOffsetsByPartition.clear();
             ackedOffsetsByPartition.clear();
         }
     }
