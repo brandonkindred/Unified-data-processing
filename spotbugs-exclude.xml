@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter
+    xmlns="https://github.com/spotbugs/filter/3.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="https://github.com/spotbugs/filter/3.0.0 https://raw.githubusercontent.com/spotbugs/spotbugs/4.8.3/spotbugs/etc/findbugsfilter.xsd">
+
+  <!--
+    Both maps are wrapped with Collections.unmodifiableMap(Map.copyOf(...))
+    in their constructors, so the references returned by these getters are
+    immutable. SpotBugs cannot infer that, and flags EI_EXPOSE_REP.
+  -->
+  <Match>
+    <Class name="com.unifieddataprocessing.pubsub.Message"/>
+    <Method name="getAttributes"/>
+    <Bug pattern="EI_EXPOSE_REP"/>
+  </Match>
+  <Match>
+    <Class name="com.unifieddataprocessing.pubsub.kafka.KafkaConsumerConfig"/>
+    <Method name="getExtras"/>
+    <Bug pattern="EI_EXPOSE_REP"/>
+  </Match>
+</FindBugsFilter>
