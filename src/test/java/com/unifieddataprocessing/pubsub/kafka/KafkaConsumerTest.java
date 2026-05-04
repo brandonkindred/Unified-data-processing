@@ -5,6 +5,7 @@ import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.CommitFailedException;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
@@ -30,6 +31,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -277,6 +280,31 @@ class KafkaConsumerTest {
         consumer.acknowledge(m44);
         verify(mockKafkaClient).commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(46L))));
         verify(mockKafkaClient, org.mockito.Mockito.times(2)).commitSync(any(Map.class));
+    }
+
+    @Test
+    void acknowledge_commitFailureLeavesStateForRetry() {
+        consumer.connect();
+        TopicPartition tp = new TopicPartition("topic-a", 0);
+        ConsumerRecord<byte[], byte[]> r50 = new ConsumerRecord<>("topic-a", 0, 50L, null, "x".getBytes());
+        when(mockKafkaClient.poll(any(Duration.class)))
+                .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r50))));
+
+        Message m = consumer.poll(Duration.ofMillis(10)).get(0);
+
+        // First ack: commitSync throws, so the watermark must NOT advance and
+        // the acked-set must still hold offset 50.
+        doThrow(new CommitFailedException()).when(mockKafkaClient).commitSync(any(Map.class));
+        assertThrows(CommitFailedException.class, () -> consumer.acknowledge(m));
+
+        // Second ack on the same Message: this time commitSync succeeds. We
+        // expect a fresh commit attempt to offset 51 — proving the retry path
+        // re-attempts the commit instead of silently dropping the ack.
+        doNothing().when(mockKafkaClient).commitSync(any(Map.class));
+        consumer.acknowledge(m);
+
+        verify(mockKafkaClient, org.mockito.Mockito.times(2))
+                .commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(51L))));
     }
 
     @Test

@@ -131,17 +131,23 @@ public class KafkaConsumer implements PubSubConsumer {
         // from the lowest unacked. We only commit when that watermark advances,
         // which prevents both regression (committing a lower offset than already
         // committed) and gap-skipping (committing past offsets still in flight).
+        // The watermark and the acked-set are mutated only after commitSync
+        // returns successfully — if commitSync throws, the caller can retry
+        // acknowledge(message) and the same commit will be re-attempted.
         NavigableSet<Long> acked = ackedOffsetsByPartition.computeIfAbsent(tp, k -> new TreeSet<>());
         acked.add(offset);
         long previousLowest = lowestUnackedByPartition.get(tp);
-        long lowest = previousLowest;
-        while (acked.remove(lowest)) {
-            lowest++;
+        long candidateLowest = previousLowest;
+        while (acked.contains(candidateLowest)) {
+            candidateLowest++;
         }
-        lowestUnackedByPartition.put(tp, lowest);
 
-        if (lowest > previousLowest) {
-            consumer.commitSync(Collections.singletonMap(tp, new OffsetAndMetadata(lowest)));
+        if (candidateLowest > previousLowest) {
+            consumer.commitSync(Collections.singletonMap(tp, new OffsetAndMetadata(candidateLowest)));
+            for (long o = previousLowest; o < candidateLowest; o++) {
+                acked.remove(o);
+            }
+            lowestUnackedByPartition.put(tp, candidateLowest);
         }
 
         partitionByMessageId.remove(message.getId());
