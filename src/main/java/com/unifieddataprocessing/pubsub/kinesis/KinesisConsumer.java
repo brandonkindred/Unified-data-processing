@@ -104,10 +104,23 @@ public class KinesisConsumer implements PubSubConsumer {
     if (client != null) {
       throw new IllegalStateException("already connected");
     }
-    client = clientFactory.apply(config);
-    // Surface stream-not-found / auth errors at connect time.
-    client.describeStreamSummary(
-        DescribeStreamSummaryRequest.builder().streamName(config.getStreamName()).build());
+    // Build the client locally and validate before publishing the reference,
+    // so a failed DescribeStreamSummary (missing stream, bad credentials,
+    // transient AWS error) leaves the consumer cleanly disconnected and
+    // releases the SDK client instead of leaking it.
+    KinesisClient newClient = clientFactory.apply(config);
+    try {
+      newClient.describeStreamSummary(
+          DescribeStreamSummaryRequest.builder().streamName(config.getStreamName()).build());
+    } catch (RuntimeException e) {
+      try {
+        newClient.close();
+      } catch (RuntimeException suppressed) {
+        e.addSuppressed(suppressed);
+      }
+      throw e;
+    }
+    client = newClient;
   }
 
   @Override

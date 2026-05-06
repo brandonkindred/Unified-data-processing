@@ -92,6 +92,22 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void connect_releasesClientWhenStreamValidationFails() {
+    // If DescribeStreamSummary fails (missing stream, bad credentials,
+    // transient error), connect() must close the SDK client and leave the
+    // consumer disconnected so a retry doesn't see "already connected".
+    when(mockClient.describeStreamSummary(any(DescribeStreamSummaryRequest.class)))
+        .thenThrow(new RuntimeException("stream not found"));
+
+    assertThrows(RuntimeException.class, consumer::connect);
+
+    verify(mockClient).close();
+    IllegalStateException notConnected =
+        assertThrows(IllegalStateException.class, () -> consumer.subscribe(STREAM));
+    assertTrue(notConnected.getMessage().contains("not connected"));
+  }
+
+  @Test
   void operationsBeforeConnect_throw() {
     assertThrows(IllegalStateException.class, () -> consumer.subscribe(STREAM));
     assertThrows(IllegalStateException.class, () -> consumer.unsubscribe(STREAM));
