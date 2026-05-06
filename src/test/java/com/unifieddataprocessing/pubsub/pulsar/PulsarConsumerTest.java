@@ -162,6 +162,47 @@ class PulsarConsumerTest {
   }
 
   @Test
+  void unsubscribe_failureKeepsEntryForRetry() throws PulsarClientException {
+    // If inner.close() throws, the entry must remain in the map so a retry can re-attempt
+    // close(); otherwise we leak the still-open inner consumer (and its broker-side
+    // subscription) because the only reference is gone.
+    consumer.connect();
+    consumer.subscribe(TOPIC_A);
+
+    doThrow(new PulsarClientException("transient")).doNothing().when(mockInnerA).close();
+
+    assertThrows(UncheckedIOException.class, () -> consumer.unsubscribe(TOPIC_A));
+    // Retry on the same topic must call close() again (entry was preserved).
+    consumer.unsubscribe(TOPIC_A);
+    verify(mockInnerA, times(2)).close();
+
+    // After a successful retry, the entry is gone; further unsubscribes are no-ops.
+    consumer.unsubscribe(TOPIC_A);
+    verify(mockInnerA, times(2)).close();
+  }
+
+  @Test
+  void unsubscribe_failureLeavesInnerReachableForWrapperClose() throws PulsarClientException {
+    // Even if the user never retries unsubscribe(), wrapper.close() must still close the
+    // inner consumer that failed to close on unsubscribe — otherwise the broker-side
+    // subscription leaks for the lifetime of the wrapper.
+    consumer.connect();
+    consumer.subscribe(TOPIC_A);
+
+    doThrow(new PulsarClientException("transient"))
+        .doNothing()
+        .when(mockInnerA)
+        .close();
+
+    assertThrows(UncheckedIOException.class, () -> consumer.unsubscribe(TOPIC_A));
+    consumer.close();
+
+    // Inner.close() called twice: once during failed unsubscribe, once during wrapper close.
+    verify(mockInnerA, times(2)).close();
+    verify(mockClient).close();
+  }
+
+  @Test
   void unsubscribe_unknownTopicIsNoOp() throws PulsarClientException {
     consumer.connect();
     consumer.unsubscribe("never-subscribed");

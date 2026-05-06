@@ -114,15 +114,20 @@ public class PulsarConsumer implements PubSubConsumer {
   public void unsubscribe(String topic) {
     Objects.requireNonNull(topic, "topic");
     ensureConnected();
-    Consumer<byte[]> inner = consumersByTopic.remove(topic);
+    Consumer<byte[]> inner = consumersByTopic.get(topic);
     if (inner == null) {
       return;
     }
+    // Remove only after a successful close so a transient close failure stays retryable —
+    // otherwise we'd lose the only reference to a still-open inner consumer and leak the
+    // underlying Pulsar subscription. Pulsar's Consumer.close() is documented idempotent,
+    // so a successful retry after a partial close is safe.
     try {
       inner.close();
     } catch (PulsarClientException e) {
       throw new UncheckedIOException(e);
     }
+    consumersByTopic.remove(topic);
   }
 
   @Override
