@@ -136,14 +136,24 @@ public class KinesisConsumer implements PubSubConsumer {
               + topic
               + "')");
     }
-    if (!subscribedTopics.add(topic)) {
+    if (subscribedTopics.contains(topic)) {
       return;
     }
-    for (Shard shard : listAllShards()) {
-      iteratorByShard.put(
+    // Acquire every shard iterator into a local map before mutating consumer
+    // state. If listAllShards or any acquireShardIterator call throws (e.g.
+    // a transient AWS error on shard N), the consumer stays cleanly
+    // unsubscribed so a retry can start from scratch and initialize all
+    // shards — avoiding a half-subscribed state where subsequent polls
+    // would silently see only a partial set of shards.
+    List<Shard> shards = listAllShards();
+    Map<String, String> newIterators = new LinkedHashMap<>();
+    for (Shard shard : shards) {
+      newIterators.put(
           shard.shardId(),
           acquireShardIterator(shard.shardId(), startingPositionFor(shard.shardId())));
     }
+    iteratorByShard.putAll(newIterators);
+    subscribedTopics.add(topic);
   }
 
   @Override

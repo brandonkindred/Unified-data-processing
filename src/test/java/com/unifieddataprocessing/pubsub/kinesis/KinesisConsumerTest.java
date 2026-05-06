@@ -526,6 +526,41 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void subscribe_doesNotPartiallyInitializeOnShardIteratorFailure() {
+    // If acquireShardIterator throws for any shard after others succeeded,
+    // no consumer state should be mutated — a retry must start from scratch
+    // and initialize all shards rather than silently skipping the failed one.
+    consumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(
+                    Shard.builder().shardId("shard-0").build(),
+                    Shard.builder().shardId("shard-1").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build())
+        .thenThrow(new RuntimeException("transient AWS error"))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0-retry").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-1-retry").build());
+
+    // First attempt fails midway through shard iterator acquisition.
+    assertThrows(RuntimeException.class, () -> consumer.subscribe(STREAM));
+
+    // No partial state: a poll should not call GetRecords for any shard,
+    // because nothing was added to iteratorByShard.
+    assertTrue(consumer.poll(Duration.ZERO).isEmpty());
+    verify(mockClient, never()).getRecords(any(GetRecordsRequest.class));
+
+    // Retry succeeds — both shards now subscribed; the next poll fetches both.
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(GetRecordsResponse.builder().nextShardIterator("X").build());
+    consumer.subscribe(STREAM);
+    consumer.poll(Duration.ZERO);
+    verify(mockClient, times(2)).getRecords(any(GetRecordsRequest.class));
+  }
+
+  @Test
   void config_rejectsInvalidGetRecordsLimit() {
     assertThrows(
         IllegalArgumentException.class,
