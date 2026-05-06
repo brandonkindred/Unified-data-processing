@@ -130,19 +130,27 @@ public class PulsarConsumer implements PubSubConsumer {
       return Collections.emptyList();
     }
 
+    // Single absolute deadline keeps poll() bounded by `timeout` regardless of how many
+    // inner consumers we visit or how messages arrive. Each receive() call still caps at
+    // perConsumerMs to give other consumers a fair shot when no traffic is available.
+    long deadlineNs = System.nanoTime() + timeout.toNanos();
     int n = consumersByTopic.size();
     long perConsumerMs = Math.max(1L, timeout.toMillis() / n);
     int budget = config.getMaxMessagesPerPoll();
     List<Message> out = new ArrayList<>();
 
     for (Map.Entry<String, Consumer<byte[]>> entry : consumersByTopic.entrySet()) {
-      if (out.size() >= budget) {
+      if (out.size() >= budget || System.nanoTime() >= deadlineNs) {
         break;
       }
       String topic = entry.getKey();
       Consumer<byte[]> inner = entry.getValue();
-      int receiveMs = (int) Math.min(perConsumerMs, Integer.MAX_VALUE);
       while (out.size() < budget) {
+        long remainingMs = (deadlineNs - System.nanoTime()) / 1_000_000L;
+        if (remainingMs <= 0) {
+          break;
+        }
+        int receiveMs = (int) Math.min(perConsumerMs, remainingMs);
         org.apache.pulsar.client.api.Message<byte[]> msg;
         try {
           msg = inner.receive(receiveMs, TimeUnit.MILLISECONDS);
