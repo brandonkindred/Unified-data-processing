@@ -55,11 +55,15 @@ public class KinesisConsumer implements PubSubConsumer {
 
   private final KinesisConsumerConfig config;
   private final Function<KinesisConsumerConfig, KinesisClient> clientFactory;
+  private final long getRecordsMinIntervalNanos;
   private final Set<String> subscribedTopics = new LinkedHashSet<>();
   // Active shard iterators keyed by shard id. Updated each poll from
   // GetRecords#nextShardIterator; a null nextShardIterator means the shard is
   // closed (resharding) so the entry is removed.
   private final Map<String, String> iteratorByShard = new HashMap<>();
+  // Per-shard timestamp of the last GetRecords call (System.nanoTime). Used to
+  // honor Kinesis's 5 TPS-per-shard cap by sleeping before the next call.
+  private final Map<String, Long> lastFetchNanosByShard = new HashMap<>();
   // Side-map: Message.id ("shardId:sequenceNumber") → (shardId, sequenceNumber).
   private final Map<String, ShardSequence> shardSeqByMessageId = new HashMap<>();
   // Per-shard delivered and acked sequence numbers, sorted by BigInteger
@@ -92,6 +96,7 @@ public class KinesisConsumer implements PubSubConsumer {
       Function<KinesisConsumerConfig, KinesisClient> clientFactory) {
     this.config = Objects.requireNonNull(config, "config");
     this.clientFactory = Objects.requireNonNull(clientFactory, "clientFactory");
+    this.getRecordsMinIntervalNanos = config.getGetRecordsMinInterval().toNanos();
   }
 
   @Override
@@ -147,6 +152,13 @@ public class KinesisConsumer implements PubSubConsumer {
     // Snapshot the keys; we may remove closed shards mid-iteration.
     List<String> shardIds = new ArrayList<>(iteratorByShard.keySet());
     for (String shardId : shardIds) {
+      // Per-shard rate limit: Kinesis caps GetRecords at 5 TPS per shard, so
+      // sleep until the configured min-interval has elapsed since the last
+      // call to this shard. Cap the sleep at the remaining poll budget so
+      // we don't exceed the caller's timeout.
+      if (!awaitNextFetch(shardId, deadlineNanos)) {
+        break;
+      }
       String iterator = iteratorByShard.get(shardId);
       GetRecordsResponse response =
           client.getRecords(
@@ -154,6 +166,7 @@ public class KinesisConsumer implements PubSubConsumer {
                   .shardIterator(iterator)
                   .limit(config.getGetRecordsLimit())
                   .build());
+      lastFetchNanosByShard.put(shardId, System.nanoTime());
       for (Record record : response.records()) {
         String seq = record.sequenceNumber();
         String id = shardId + ":" + seq;
@@ -175,6 +188,7 @@ public class KinesisConsumer implements PubSubConsumer {
         // Shard is closed (split/merge). A KCL-based implementation would
         // discover and start its children here; this raw-SDK cut just stops.
         iteratorByShard.remove(shardId);
+        lastFetchNanosByShard.remove(shardId);
       } else {
         iteratorByShard.put(shardId, response.nextShardIterator());
       }
@@ -244,6 +258,7 @@ public class KinesisConsumer implements PubSubConsumer {
       client = null;
       subscribedTopics.clear();
       iteratorByShard.clear();
+      lastFetchNanosByShard.clear();
       shardSeqByMessageId.clear();
       deliveredSeqsByShard.clear();
       ackedSeqsByShard.clear();
@@ -296,6 +311,40 @@ public class KinesisConsumer implements PubSubConsumer {
     }
     GetShardIteratorResponse resp = client.getShardIterator(req.build());
     return resp.shardIterator();
+  }
+
+  /**
+   * Sleeps until the {@link KinesisConsumerConfig#getGetRecordsMinInterval()} has elapsed since
+   * the last {@code GetRecords} call to {@code shardId}, capped at the remaining poll budget.
+   * Returns {@code true} if it's OK to call {@code GetRecords} now; {@code false} if the budget
+   * is exhausted or the thread was interrupted while waiting (caller should bail out).
+   */
+  private boolean awaitNextFetch(String shardId, long deadlineNanos) {
+    if (getRecordsMinIntervalNanos <= 0) {
+      return true;
+    }
+    long now = System.nanoTime();
+    Long lastFetch = lastFetchNanosByShard.get(shardId);
+    if (lastFetch == null) {
+      return true;
+    }
+    long waitNanos = lastFetch + getRecordsMinIntervalNanos - now;
+    if (waitNanos <= 0) {
+      return true;
+    }
+    long remaining = deadlineNanos - now;
+    if (remaining <= 0) {
+      return false;
+    }
+    try {
+      TimeUnit.NANOSECONDS.sleep(Math.min(waitNanos, remaining));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    }
+    // If we capped the sleep at the remaining budget, we still haven't waited
+    // out the per-shard interval — bail rather than risk a throttle exception.
+    return waitNanos <= remaining;
   }
 
   private void ensureConnected() {

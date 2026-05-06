@@ -55,13 +55,16 @@ class KinesisConsumerTest {
   @BeforeEach
   void setUp() {
     capturedConfig = new AtomicReference<>();
+    // Throttling disabled by default so tests don't sleep between back-to-back
+    // GetRecords calls; the dedicated throttle test sets a non-zero interval.
     config =
         new KinesisConsumerConfig(
             STREAM,
             Region.US_EAST_1,
             StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
             KinesisStartingPosition.trimHorizon(),
-            100);
+            100,
+            Duration.ZERO);
     consumer =
         new KinesisConsumer(
             config,
@@ -184,7 +187,8 @@ class KinesisConsumerTest {
             Region.US_EAST_1,
             StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
             KinesisStartingPosition.atTimestamp(Instant.parse("2026-01-01T00:00:00Z")),
-            100);
+            100,
+            Duration.ZERO);
     KinesisConsumer tsConsumer = new KinesisConsumer(timestampConfig, c -> mockClient);
     tsConsumer.connect();
     when(mockClient.listShards(any(ListShardsRequest.class)))
@@ -422,7 +426,115 @@ class KinesisConsumerTest {
                 Region.US_EAST_1,
                 StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
                 KinesisStartingPosition.latest(),
-                10_000));
+                10_001));
+  }
+
+  @Test
+  void config_acceptsKinesisMaximumGetRecordsLimit() {
+    new KinesisConsumerConfig(
+        STREAM,
+        Region.US_EAST_1,
+        StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+        KinesisStartingPosition.latest(),
+        10_000);
+  }
+
+  @Test
+  void config_rejectsNegativeGetRecordsMinInterval() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new KinesisConsumerConfig(
+                STREAM,
+                Region.US_EAST_1,
+                StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+                KinesisStartingPosition.latest(),
+                100,
+                Duration.ofMillis(-1)));
+  }
+
+  @Test
+  void poll_throttlesGetRecordsToConfiguredMinIntervalPerShard() {
+    // With min-interval = 100ms, two back-to-back successful polls on the same
+    // shard must space the underlying GetRecords calls at least ~100ms apart
+    // so we don't trip Kinesis's 5 TPS-per-shard cap.
+    KinesisConsumerConfig throttledConfig =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ofMillis(100));
+    KinesisConsumer throttled = new KinesisConsumer(throttledConfig, c -> mockClient);
+    throttled.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER").build());
+    Record record =
+        Record.builder()
+            .sequenceNumber("1")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("x"))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder().records(record).nextShardIterator("ITER-N").build());
+    throttled.subscribe(STREAM);
+
+    long start = System.nanoTime();
+    throttled.poll(Duration.ofMillis(500));
+    throttled.poll(Duration.ofMillis(500));
+    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+    verify(mockClient, times(2)).getRecords(any(GetRecordsRequest.class));
+    assertTrue(
+        elapsedMs >= 90,
+        "Expected ~100ms throttle between GetRecords on the same shard, observed " + elapsedMs);
+  }
+
+  @Test
+  void poll_skipsShardWhenThrottleExceedsRemainingTimeout() {
+    // When the per-shard throttle would push past the caller's poll timeout,
+    // poll() must return promptly without an extra GetRecords call (otherwise
+    // we'd silently exceed the deadline).
+    KinesisConsumerConfig throttledConfig =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ofSeconds(1));
+    KinesisConsumer throttled = new KinesisConsumer(throttledConfig, c -> mockClient);
+    throttled.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER").build());
+    Record record =
+        Record.builder()
+            .sequenceNumber("1")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("x"))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder().records(record).nextShardIterator("ITER-N").build());
+    throttled.subscribe(STREAM);
+
+    throttled.poll(Duration.ofMillis(50));
+    // Second poll's budget (50ms) can't cover the 1s throttle gap → bails out.
+    throttled.poll(Duration.ofMillis(50));
+
+    verify(mockClient, times(1)).getRecords(any(GetRecordsRequest.class));
   }
 
   /**
