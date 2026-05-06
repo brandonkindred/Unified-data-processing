@@ -324,6 +324,55 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void poll_resumesFromLowestUnackedSequenceOnExpiryWhenNoCheckpointYet() {
+    // If the iterator expires after records were delivered but before any ack
+    // has advanced the watermark, the reacquire must use the lowest unacked
+    // sequence — not the configured starting position — so unacked records
+    // are redelivered (at-least-once) rather than silently skipped.
+    consumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-INITIAL").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-AFTER-EXPIRY").build());
+    Record r100 =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    Record r105 =
+        Record.builder()
+            .sequenceNumber("105")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("b"))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder().records(r100, r105).nextShardIterator("ITER-1").build())
+        .thenThrow(ExpiredIteratorException.builder().message("expired").build())
+        .thenReturn(GetRecordsResponse.builder().nextShardIterator("ITER-2").build());
+    consumer.subscribe(STREAM);
+
+    // First poll delivers two records but no ack happens.
+    consumer.poll(Duration.ofMillis(50));
+    assertNull(consumer.getCheckpoints().get("shard-0"));
+
+    // Second poll: GetRecords throws ExpiredIteratorException → reacquire.
+    consumer.poll(Duration.ofMillis(50));
+
+    ArgumentCaptor<GetShardIteratorRequest> captor =
+        ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+    verify(mockClient, times(2)).getShardIterator(captor.capture());
+    GetShardIteratorRequest reacquire = captor.getAllValues().get(1);
+    assertEquals(ShardIteratorType.AT_SEQUENCE_NUMBER, reacquire.shardIteratorType());
+    assertEquals("100", reacquire.startingSequenceNumber());
+  }
+
+  @Test
   void acknowledge_tracksHighestSequenceNumberPerShard() {
     consumer.connect();
     seedTwoMessagesOnShard("shard-0", "100", "105");

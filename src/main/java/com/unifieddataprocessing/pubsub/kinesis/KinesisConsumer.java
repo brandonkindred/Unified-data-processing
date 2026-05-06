@@ -374,14 +374,24 @@ public class KinesisConsumer implements PubSubConsumer {
   }
 
   /**
-   * Position to resume from after an iterator expires: the highest acked sequence (so already
-   * acked records are not redelivered), falling back to the initial starting position when no
-   * progress has been recorded.
+   * Position to resume from after an iterator expires. Prefers the highest acked sequence
+   * (so already acked records are not redelivered); if no acks have advanced the watermark
+   * yet but records have been delivered, falls back to the lowest delivered-but-unacked
+   * sequence so those records are redelivered (preserving at-least-once); otherwise falls
+   * back to the initial starting position.
    */
   private KinesisStartingPosition resumePositionFor(String shardId) {
     BigInteger watermark = highWatermarkByShard.get(shardId);
     if (watermark != null) {
       return KinesisStartingPosition.afterSequenceNumber(watermark.toString());
+    }
+    NavigableSet<BigInteger> delivered = deliveredSeqsByShard.get(shardId);
+    if (delivered != null && !delivered.isEmpty()) {
+      // Records have been delivered but no ack has advanced the watermark.
+      // Resuming at the configured starting position (especially LATEST)
+      // would skip these unacked records permanently; AT_SEQUENCE_NUMBER on
+      // the lowest one redelivers everything that's still outstanding.
+      return KinesisStartingPosition.atSequenceNumber(delivered.first().toString());
     }
     return startingPositionFor(shardId);
   }
