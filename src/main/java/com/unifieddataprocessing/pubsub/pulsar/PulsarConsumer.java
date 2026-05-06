@@ -33,6 +33,9 @@ import org.apache.pulsar.client.api.Schema;
  * <p>Pattern-based subscriptions ({@code topicsPattern}) are intentionally out of scope; the
  * framework {@code subscribe(String)} verb takes a literal topic name.
  *
+ * <p>Framework {@code Message.id} format is {@code "<topic>-<MessageId.toString()>"} so that
+ * identical Pulsar positions on different topics do not collide in the per-message ack side-map.
+ *
  * <p>Not thread-safe.
  */
 public class PulsarConsumer implements PubSubConsumer {
@@ -168,7 +171,11 @@ public class PulsarConsumer implements PubSubConsumer {
 
   private Message toFrameworkMessage(
       org.apache.pulsar.client.api.Message<byte[]> pm, String topic, Consumer<byte[]> owner) {
-    String id = pm.getMessageId().toString();
+    // Pulsar MessageId is a position within a topic/partition (ledger:entry:partition:batch)
+    // and does NOT encode the topic, so identical positions on different topics collide in a
+    // single-keyed side-map. Prefix with topic to make the framework id unique across topics
+    // (mirrors KafkaConsumer's "topic-partition-offset" id format).
+    String id = topic + "-" + pm.getMessageId().toString();
     byte[] payload = pm.getValue() == null ? new byte[0] : pm.getValue();
     Map<String, String> rawProps = pm.getProperties();
     Map<String, String> attributes =

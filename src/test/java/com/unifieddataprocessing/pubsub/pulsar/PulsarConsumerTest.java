@@ -203,7 +203,7 @@ class PulsarConsumerTest {
 
     assertEquals(1, messages.size());
     Message m = messages.get(0);
-    assertEquals(mockMessageIdA.toString(), m.getId());
+    assertEquals(TOPIC_A + "-" + mockMessageIdA.toString(), m.getId());
     assertEquals(TOPIC_A, m.getTopic());
     assertArrayEquals("payload".getBytes(), m.getPayload());
     assertEquals("v", m.getAttributes().get("k"));
@@ -301,6 +301,50 @@ class PulsarConsumerTest {
 
     verify(mockInnerA).acknowledge(mockMessageIdA);
     verify(mockInnerB, never()).acknowledge(any(MessageId.class));
+  }
+
+  @Test
+  void acknowledge_distinctTopicsWithSamePulsarIdDoNotCollide() throws PulsarClientException {
+    // Pulsar's MessageId is a position within a topic/partition and does not encode the topic
+    // — the same ledger:entry:partition:batch can legitimately appear on two different topics.
+    // The framework Message.id must remain unique across topics so that ack-routing isn't
+    // broken by side-map collisions.
+    consumer.connect();
+    consumer.subscribe(TOPIC_A);
+    consumer.subscribe(TOPIC_B);
+
+    // Both topics deliver a message whose Pulsar MessageId stringifies to the same value.
+    MessageId sharedPulsarId = mockMessageIdA;
+    when(mockMsgA.getMessageId()).thenReturn(sharedPulsarId);
+    when(mockMsgA.getValue()).thenReturn("a".getBytes());
+    when(mockMsgA.getProperties()).thenReturn(Map.of());
+    when(mockMsgB.getMessageId()).thenReturn(sharedPulsarId);
+    when(mockMsgB.getValue()).thenReturn("b".getBytes());
+    when(mockMsgB.getProperties()).thenReturn(Map.of());
+    when(mockInnerA.receive(anyInt(), eq(TimeUnit.MILLISECONDS)))
+        .thenReturn(mockMsgA)
+        .thenReturn(null);
+    when(mockInnerB.receive(anyInt(), eq(TimeUnit.MILLISECONDS)))
+        .thenReturn(mockMsgB)
+        .thenReturn(null);
+
+    List<Message> messages = consumer.poll(Duration.ofMillis(20));
+
+    assertEquals(2, messages.size());
+    Message fromA = messages.get(0);
+    Message fromB = messages.get(1);
+    // Distinct framework ids despite identical Pulsar MessageIds.
+    assertTrue(!fromA.getId().equals(fromB.getId()), "framework ids collided: " + fromA.getId());
+
+    // Acking the topic-a message must route to inner-a; acking the topic-b message must
+    // route to inner-b. Without the topic prefix, the second poll's side-map put would
+    // overwrite the first and acking fromA would erroneously route to inner-b.
+    consumer.acknowledge(fromA);
+    verify(mockInnerA, times(1)).acknowledge(sharedPulsarId);
+    verify(mockInnerB, never()).acknowledge(any(MessageId.class));
+
+    consumer.acknowledge(fromB);
+    verify(mockInnerB, times(1)).acknowledge(sharedPulsarId);
   }
 
   @Test
