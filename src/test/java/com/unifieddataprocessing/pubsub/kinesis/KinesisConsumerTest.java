@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -748,6 +749,101 @@ class KinesisConsumerTest {
     assertTrue(
         elapsedMs >= 220,
         "Expected ~250ms byte-based throttle after a 500 KiB response, observed " + elapsedMs);
+  }
+
+  @Test
+  void poll_continuesPastThrottledShardToServiceReadyOnes() throws InterruptedException {
+    // After both shards fetch in the first poll, shard-0 is throttled by the
+    // byte budget (~250 ms for 500 KiB) and shard-1 only by the small TPS
+    // interval. Once shard-1's throttle expires but shard-0's hasn't, a poll
+    // within shard-0's remaining throttle must still service shard-1 — the
+    // throttled shard cannot block ready shards.
+    KinesisConsumerConfig cfg =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ofMillis(50));
+    KinesisConsumer multi = new KinesisConsumer(cfg, c -> mockClient);
+    multi.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(
+                    Shard.builder().shardId("shard-0").build(),
+                    Shard.builder().shardId("shard-1").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-1").build());
+
+    // shard-0's first response is large (~250ms byte throttle); shard-1's is small.
+    Record largeRecord =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromByteArray(new byte[500 * 1024]))
+            .build();
+    Record smallRecord =
+        Record.builder()
+            .sequenceNumber("200")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("x"))
+            .build();
+    Record smallRecord2 =
+        Record.builder()
+            .sequenceNumber("201")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("y"))
+            .build();
+    when(mockClient.getRecords(
+            argThat(
+                (GetRecordsRequest req) ->
+                    req != null
+                        && req.shardIterator() != null
+                        && req.shardIterator().startsWith("ITER-0"))))
+        .thenReturn(
+            GetRecordsResponse.builder()
+                .records(largeRecord)
+                .nextShardIterator("ITER-0-NEXT")
+                .build());
+    when(mockClient.getRecords(
+            argThat(
+                (GetRecordsRequest req) ->
+                    req != null
+                        && req.shardIterator() != null
+                        && req.shardIterator().startsWith("ITER-1"))))
+        .thenReturn(
+            GetRecordsResponse.builder()
+                .records(smallRecord)
+                .nextShardIterator("ITER-1-NEXT")
+                .build())
+        .thenReturn(
+            GetRecordsResponse.builder()
+                .records(smallRecord2)
+                .nextShardIterator("ITER-1-NEXT-NEXT")
+                .build());
+
+    multi.subscribe(STREAM);
+
+    // First poll: both shards fetch.
+    List<Message> first = multi.poll(Duration.ofMillis(100));
+    assertEquals(2, first.size());
+
+    // Wait past shard-1's TPS throttle (~50 ms) but within shard-0's byte
+    // throttle (~250 ms remaining ≈ 170 ms after this sleep).
+    Thread.sleep(80);
+
+    // Second poll with a 30 ms budget. shard-0 still throttled; shard-1 ready.
+    // With break, we'd wait the full budget on shard-0 and never see shard-1.
+    // With continue, shard-1 gets serviced regardless of iteration order.
+    List<Message> second = multi.poll(Duration.ofMillis(30));
+    assertEquals(1, second.size());
+    assertTrue(
+        second.get(0).getId().startsWith("shard-1:"),
+        "Expected the ready shard-1 to be polled, got " + second.get(0).getId());
   }
 
   @Test

@@ -66,8 +66,9 @@ public class KinesisConsumer implements PubSubConsumer {
   private final Set<String> subscribedTopics = new LinkedHashSet<>();
   // Active shard iterators keyed by shard id. Updated each poll from
   // GetRecords#nextShardIterator; a null nextShardIterator means the shard is
-  // closed (resharding) so the entry is removed.
-  private final Map<String, String> iteratorByShard = new HashMap<>();
+  // closed (resharding) so the entry is removed. LinkedHashMap so poll()
+  // visits shards in subscribe order — deterministic and fair across calls.
+  private final Map<String, String> iteratorByShard = new LinkedHashMap<>();
   // Per-shard wall-clock (System.nanoTime) at which the next GetRecords call is
   // allowed. Updated after every fetch to the later of the TPS limit
   // (now + getRecordsMinInterval) and the byte limit
@@ -189,9 +190,11 @@ public class KinesisConsumer implements PubSubConsumer {
       // Per-shard rate limit: Kinesis caps GetRecords at 5 TPS *and* 2 MiB/s
       // per shard. Sleep until both budgets have been replenished from the
       // last call. Cap the sleep at the remaining poll budget so we don't
-      // exceed the caller's timeout.
+      // exceed the caller's timeout. If this shard's throttle outlasts the
+      // budget, skip it (continue) so a ready shard later in the iteration
+      // order isn't blocked behind a throttled one.
       if (!awaitNextFetch(shardId, deadlineNanos)) {
-        break;
+        continue;
       }
       String iterator = iteratorByShard.get(shardId);
       GetRecordsResponse response;
