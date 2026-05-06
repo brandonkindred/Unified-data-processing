@@ -112,15 +112,18 @@ public final class PulsarConsumerConfig {
   /** Applies this config to a {@link ClientBuilder} and returns it for chaining. */
   public ClientBuilder applyToClientBuilder(ClientBuilder builder) {
     Objects.requireNonNull(builder, "builder");
+    // Apply caller-supplied extras first so wrapper-controlled fields below remain
+    // authoritative — otherwise extras like `serviceUrl` could override the configured
+    // broker. Mirrors KafkaConsumerConfig.toProperties() ordering.
+    if (!clientExtras.isEmpty()) {
+      builder.loadConf(clientExtras);
+    }
     builder.serviceUrl(serviceUrl);
     if (authToken != null) {
       builder.authentication(AuthenticationFactory.token(authToken));
     }
     if (operationTimeout != null) {
       builder.operationTimeout((int) operationTimeout.toMillis(), TimeUnit.MILLISECONDS);
-    }
-    if (!clientExtras.isEmpty()) {
-      builder.loadConf(clientExtras);
     }
     return builder;
   }
@@ -133,12 +136,17 @@ public final class PulsarConsumerConfig {
       ConsumerBuilder<byte[]> builder, Collection<String> topics) {
     Objects.requireNonNull(builder, "builder");
     Objects.requireNonNull(topics, "topics");
-    builder.subscriptionName(subscriptionName);
-    builder.subscriptionType(subscriptionType);
-    builder.topics(new java.util.ArrayList<>(topics));
+    // Apply caller-supplied extras first so wrapper-controlled fields (subscription
+    // name/type and topic list) cannot be overridden by extras like `topicNames` or
+    // `subscriptionName`. Mirrors KafkaConsumerConfig.toProperties() ordering and keeps
+    // subscribe(String) authoritative while still allowing tuning options (e.g.
+    // receiverQueueSize, ackTimeoutMillis).
     if (!consumerExtras.isEmpty()) {
       builder.loadConf(consumerExtras);
     }
+    builder.subscriptionName(subscriptionName);
+    builder.subscriptionType(subscriptionType);
+    builder.topics(new java.util.ArrayList<>(topics));
     return builder;
   }
 }

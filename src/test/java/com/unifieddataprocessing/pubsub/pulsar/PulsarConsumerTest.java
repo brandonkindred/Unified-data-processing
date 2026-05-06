@@ -367,6 +367,49 @@ class PulsarConsumerTest {
   }
 
   @Test
+  void poll_rotatesStartingConsumerAcrossPolls() throws PulsarClientException {
+    // budget=1, N=2. Without cross-poll rotation, topic-a always wins (insertion order)
+    // and topic-b is starved indefinitely. With rotation, the second poll starts at
+    // topic-b, so each topic gets first crack on alternating polls.
+    PulsarConsumerConfig cfg =
+        new PulsarConsumerConfig(
+            SERVICE_URL,
+            SUBSCRIPTION,
+            null,
+            null,
+            1, // maxMessagesPerPoll < N
+            null,
+            null,
+            null);
+    consumer = new PulsarConsumer(cfg, factory());
+    consumer.connect();
+    consumer.subscribe(TOPIC_A);
+    consumer.subscribe(TOPIC_B);
+
+    when(mockMsgA.getMessageId()).thenReturn(mockMessageIdA);
+    when(mockMsgA.getValue()).thenReturn("a".getBytes());
+    when(mockMsgA.getProperties()).thenReturn(Map.of());
+    when(mockMsgB.getMessageId()).thenReturn(mockMessageIdB);
+    when(mockMsgB.getValue()).thenReturn("b".getBytes());
+    when(mockMsgB.getProperties()).thenReturn(Map.of());
+    // Both topics always have messages — only rotation prevents starvation.
+    when(mockInnerA.receive(anyInt(), eq(TimeUnit.MILLISECONDS))).thenReturn(mockMsgA);
+    when(mockInnerB.receive(anyInt(), eq(TimeUnit.MILLISECONDS))).thenReturn(mockMsgB);
+
+    // First poll starts at index 0 → topic-a wins.
+    Message first = consumer.poll(Duration.ofMillis(20)).get(0);
+    assertEquals(TOPIC_A, first.getTopic());
+
+    // Second poll starts at index 1 → topic-b wins.
+    Message second = consumer.poll(Duration.ofMillis(20)).get(0);
+    assertEquals(TOPIC_B, second.getTopic());
+
+    // Third poll wraps back to topic-a.
+    Message third = consumer.poll(Duration.ofMillis(20)).get(0);
+    assertEquals(TOPIC_A, third.getTopic());
+  }
+
+  @Test
   void acknowledge_routesToOwnerInnerConsumer() throws PulsarClientException {
     consumer.connect();
     consumer.subscribe(TOPIC_A);

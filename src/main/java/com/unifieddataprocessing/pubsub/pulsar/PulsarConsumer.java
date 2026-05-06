@@ -58,6 +58,11 @@ public class PulsarConsumer implements PubSubConsumer {
   private final Map<String, AckEntry> ackEntries = new HashMap<>();
 
   private PulsarClient client;
+  // Round-robin cursor across polls. Without this, when N > maxMessagesPerPoll a busy
+  // earlier topic permanently starves later topics: each poll fills the budget from the
+  // first consumer and never reaches the rest. Advancing one slot per poll guarantees
+  // every subscribed topic eventually gets first crack.
+  private long pollCount;
 
   /** Creates a consumer that builds real Pulsar clients on {@link #connect()}. */
   public PulsarConsumer(PulsarConsumerConfig config) {
@@ -153,10 +158,19 @@ public class PulsarConsumer implements PubSubConsumer {
     int perConsumerBudget = Math.max(1, budget / n);
     List<Message> out = new ArrayList<>();
 
-    for (Map.Entry<String, Consumer<byte[]>> entry : consumersByTopic.entrySet()) {
+    // Snapshot in insertion order, then visit starting from the rotating cursor so a
+    // small budget can't permanently starve later subscriptions across polls. The
+    // counter is advanced once per poll regardless of which consumer actually delivered.
+    List<Map.Entry<String, Consumer<byte[]>>> entries =
+        new ArrayList<>(consumersByTopic.entrySet());
+    int startOffset = (int) Math.floorMod(pollCount, n);
+    pollCount++;
+
+    for (int i = 0; i < entries.size(); i++) {
       if (out.size() >= budget || System.nanoTime() >= deadlineNs) {
         break;
       }
+      Map.Entry<String, Consumer<byte[]>> entry = entries.get((startOffset + i) % entries.size());
       String topic = entry.getKey();
       Consumer<byte[]> inner = entry.getValue();
       int taken = 0;
@@ -239,6 +253,7 @@ public class PulsarConsumer implements PubSubConsumer {
       client = null;
       consumersByTopic.clear();
       ackEntries.clear();
+      pollCount = 0;
     }
   }
 
