@@ -11,8 +11,11 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import software.amazon.awssdk.services.kinesis.KinesisClient;
 import software.amazon.awssdk.services.kinesis.model.DescribeStreamSummaryRequest;
@@ -59,9 +62,16 @@ public class KinesisConsumer implements PubSubConsumer {
   private final Map<String, String> iteratorByShard = new HashMap<>();
   // Side-map: Message.id ("shardId:sequenceNumber") → (shardId, sequenceNumber).
   private final Map<String, ShardSequence> shardSeqByMessageId = new HashMap<>();
-  // In-memory checkpoint: shardId → highest acked sequence number. Kinesis
-  // sequence numbers are lexicographic numeric strings, so comparisons must
-  // use BigInteger.compareTo (not String#compareTo).
+  // Per-shard delivered and acked sequence numbers, sorted by BigInteger
+  // natural order. The checkpoint advances only across the longest fully-acked
+  // prefix of delivered, so an out-of-order ack on a higher seq cannot skip
+  // earlier in-flight records on the same shard. Mirrors KafkaConsumer's
+  // gap-tolerant watermark logic.
+  private final Map<String, NavigableSet<BigInteger>> deliveredSeqsByShard = new HashMap<>();
+  private final Map<String, NavigableSet<BigInteger>> ackedSeqsByShard = new HashMap<>();
+  // In-memory checkpoint: shardId → highest contiguously-acked sequence number.
+  // Kinesis sequence numbers are lexicographic numeric strings, so comparisons
+  // must use BigInteger.compareTo (not String#compareTo).
   private final Map<String, BigInteger> highWatermarkByShard = new HashMap<>();
 
   private KinesisClient client;
@@ -132,6 +142,7 @@ public class KinesisConsumer implements PubSubConsumer {
     if (iteratorByShard.isEmpty()) {
       return Collections.emptyList();
     }
+    long deadlineNanos = System.nanoTime() + timeout.toNanos();
     List<Message> result = new ArrayList<>();
     // Snapshot the keys; we may remove closed shards mid-iteration.
     List<String> shardIds = new ArrayList<>(iteratorByShard.keySet());
@@ -155,6 +166,9 @@ public class KinesisConsumer implements PubSubConsumer {
         }
         byte[] payload = record.data() == null ? new byte[0] : record.data().asByteArray();
         shardSeqByMessageId.put(id, new ShardSequence(shardId, seq));
+        deliveredSeqsByShard
+            .computeIfAbsent(shardId, k -> new TreeSet<>())
+            .add(new BigInteger(seq));
         result.add(new Message(id, config.getStreamName(), payload, attributes));
       }
       if (response.nextShardIterator() == null) {
@@ -163,6 +177,19 @@ public class KinesisConsumer implements PubSubConsumer {
         iteratorByShard.remove(shardId);
       } else {
         iteratorByShard.put(shardId, response.nextShardIterator());
+      }
+    }
+    // GetRecords doesn't long-poll, so an idle stream returns immediately.
+    // Block out the remainder of the caller's timeout to avoid spin-loops in
+    // the empty case (matches the blocking semantics callers get from Kafka).
+    if (result.isEmpty()) {
+      long remainingNanos = deadlineNanos - System.nanoTime();
+      if (remainingNanos > 0) {
+        try {
+          TimeUnit.NANOSECONDS.sleep(remainingNanos);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
       }
     }
     return result;
@@ -180,9 +207,28 @@ public class KinesisConsumer implements PubSubConsumer {
               + ". Only messages returned by poll() can be acknowledged.");
     }
     BigInteger seq = new BigInteger(ss.sequenceNumber());
-    BigInteger current = highWatermarkByShard.get(ss.shardId());
-    if (current == null || seq.compareTo(current) > 0) {
-      highWatermarkByShard.put(ss.shardId(), seq);
+    NavigableSet<BigInteger> delivered =
+        deliveredSeqsByShard.computeIfAbsent(ss.shardId(), k -> new TreeSet<>());
+    NavigableSet<BigInteger> acked =
+        ackedSeqsByShard.computeIfAbsent(ss.shardId(), k -> new TreeSet<>());
+    acked.add(seq);
+
+    // Walk delivered seqs in order; the highest fully-acked prefix sets the
+    // checkpoint. This ensures getCheckpoints() never advances past an
+    // unacked record on the same shard — persisting the watermark and
+    // restarting with afterSequenceNumber(...) is safe.
+    BigInteger highestPrefix = null;
+    for (BigInteger d : delivered) {
+      if (acked.contains(d)) {
+        highestPrefix = d;
+      } else {
+        break;
+      }
+    }
+    if (highestPrefix != null) {
+      highWatermarkByShard.put(ss.shardId(), highestPrefix);
+      delivered.headSet(highestPrefix, true).clear();
+      acked.headSet(highestPrefix, true).clear();
     }
     shardSeqByMessageId.remove(message.getId());
   }
@@ -199,6 +245,8 @@ public class KinesisConsumer implements PubSubConsumer {
       subscribedTopics.clear();
       iteratorByShard.clear();
       shardSeqByMessageId.clear();
+      deliveredSeqsByShard.clear();
+      ackedSeqsByShard.clear();
       // highWatermarkByShard intentionally retained so getCheckpoints() can be
       // read post-close to persist final state.
     }

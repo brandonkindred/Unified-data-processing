@@ -2,6 +2,7 @@ package com.unifieddataprocessing.pubsub.kinesis;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -16,6 +17,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -313,16 +315,60 @@ class KinesisConsumerTest {
   }
 
   @Test
-  void acknowledge_outOfOrderDoesNotRegressWatermark() {
+  void acknowledge_doesNotAdvanceCheckpointPastUnackedSequence() {
+    // If acks arrive out of order, the checkpoint must NOT advance past an
+    // unacked record. Otherwise persisting it and restarting with
+    // afterSequenceNumber(...) would skip the in-flight record permanently.
     consumer.connect();
-    // The lexicographic gotcha: as strings, "2" > "10". With BigInteger, "10" > "2".
+    seedTwoMessagesOnShard("shard-0", "100", "105");
+
+    List<Message> messages = consumer.poll(Duration.ofMillis(10));
+
+    // Ack "105" first while "100" is still in flight: no checkpoint yet.
+    consumer.acknowledge(messages.get(1));
+    assertNull(consumer.getCheckpoints().get("shard-0"));
+
+    // Ack "100": prefix advances all the way to "105" in one step.
+    consumer.acknowledge(messages.get(0));
+    assertEquals("105", consumer.getCheckpoints().get("shard-0"));
+  }
+
+  @Test
+  void acknowledge_usesBigIntegerComparisonForLexicographicSequenceNumbers() {
+    // The lexicographic gotcha: as strings, "2" > "10"; as BigInteger, "10" > "2".
+    // After both are acked, the checkpoint must reflect numeric (not string) order.
+    consumer.connect();
     seedTwoMessagesOnShard("shard-0", "10", "2");
 
     List<Message> messages = consumer.poll(Duration.ofMillis(10));
-    consumer.acknowledge(messages.get(0)); // ack "10" first
-    consumer.acknowledge(messages.get(1)); // then ack "2" — must NOT replace watermark
+    consumer.acknowledge(messages.get(0)); // ack "10"
+    consumer.acknowledge(messages.get(1)); // ack "2"
 
     assertEquals("10", consumer.getCheckpoints().get("shard-0"));
+  }
+
+  @Test
+  void poll_sleepsForRemainingTimeoutWhenAllShardsEmpty() {
+    consumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build());
+    consumer.subscribe(STREAM);
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(GetRecordsResponse.builder().nextShardIterator("ITER-1").build());
+
+    long start = System.nanoTime();
+    List<Message> result = consumer.poll(Duration.ofMillis(50));
+    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+    assertTrue(result.isEmpty());
+    assertTrue(
+        elapsedMs >= 45,
+        "Expected poll() to sleep ~50ms when GetRecords returned empty, slept " + elapsedMs);
   }
 
   @Test
