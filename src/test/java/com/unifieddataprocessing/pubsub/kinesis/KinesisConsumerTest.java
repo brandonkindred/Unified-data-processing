@@ -651,6 +651,57 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void poll_throttlesByBytesAfterLargeResponse() {
+    // Kinesis caps each shard at 2 MiB/s for GetRecords. After a large
+    // response, the byte budget can require a longer wait than the TPS
+    // budget; honoring only TPS would still trip ProvisionedThroughputExceededException.
+    KinesisConsumerConfig byteThrottled =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            // Deliberately small TPS interval so the byte limit dominates.
+            Duration.ofMillis(10));
+    KinesisConsumer throttled = new KinesisConsumer(byteThrottled, c -> mockClient);
+    throttled.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER").build());
+
+    // 500 KiB payload → 500 KiB / 2 MiB/s = 250 ms minimum gap.
+    byte[] largePayload = new byte[500 * 1024];
+    Record largeRecord =
+        Record.builder()
+            .sequenceNumber("1")
+            .partitionKey("pk")
+            .data(SdkBytes.fromByteArray(largePayload))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder()
+                .records(largeRecord)
+                .nextShardIterator("ITER-N")
+                .build());
+    throttled.subscribe(STREAM);
+
+    long start = System.nanoTime();
+    throttled.poll(Duration.ofMillis(1000));
+    throttled.poll(Duration.ofMillis(1000));
+    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+    verify(mockClient, times(2)).getRecords(any(GetRecordsRequest.class));
+    assertTrue(
+        elapsedMs >= 220,
+        "Expected ~250ms byte-based throttle after a 500 KiB response, observed " + elapsedMs);
+  }
+
+  @Test
   void poll_skipsShardWhenThrottleExceedsRemainingTimeout() {
     // When the per-shard throttle would push past the caller's poll timeout,
     // poll() must return promptly without an extra GetRecords call (otherwise

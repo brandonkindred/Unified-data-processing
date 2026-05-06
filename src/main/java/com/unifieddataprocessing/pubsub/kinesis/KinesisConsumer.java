@@ -54,6 +54,12 @@ public class KinesisConsumer implements PubSubConsumer {
   /** {@link Message} attribute key carrying the record's approximate arrival timestamp. */
   public static final String ATTR_APPROXIMATE_ARRIVAL_TIMESTAMP = "approximateArrivalTimestamp";
 
+  /**
+   * Kinesis's documented per-shard read budget for {@code GetRecords} (2 MiB/sec). Used to
+   * back off when a single fetch returns more bytes than the next 200 ms can absorb.
+   */
+  private static final long READ_BYTES_PER_SECOND_PER_SHARD = 2L * 1024L * 1024L;
+
   private final KinesisConsumerConfig config;
   private final Function<KinesisConsumerConfig, KinesisClient> clientFactory;
   private final long getRecordsMinIntervalNanos;
@@ -62,9 +68,11 @@ public class KinesisConsumer implements PubSubConsumer {
   // GetRecords#nextShardIterator; a null nextShardIterator means the shard is
   // closed (resharding) so the entry is removed.
   private final Map<String, String> iteratorByShard = new HashMap<>();
-  // Per-shard timestamp of the last GetRecords call (System.nanoTime). Used to
-  // honor Kinesis's 5 TPS-per-shard cap by sleeping before the next call.
-  private final Map<String, Long> lastFetchNanosByShard = new HashMap<>();
+  // Per-shard wall-clock (System.nanoTime) at which the next GetRecords call is
+  // allowed. Updated after every fetch to the later of the TPS limit
+  // (now + getRecordsMinInterval) and the byte limit
+  // (now + bytes-just-read / 2 MiB-per-sec) — Kinesis enforces both per shard.
+  private final Map<String, Long> nextAllowedFetchNanosByShard = new HashMap<>();
   // Side-map: Message.id ("shardId:sequenceNumber") → (shardId, sequenceNumber).
   private final Map<String, ShardSequence> shardSeqByMessageId = new HashMap<>();
   // Per-shard delivered and acked sequence numbers, sorted by BigInteger
@@ -178,10 +186,10 @@ public class KinesisConsumer implements PubSubConsumer {
     // Snapshot the keys; we may remove closed shards mid-iteration.
     List<String> shardIds = new ArrayList<>(iteratorByShard.keySet());
     for (String shardId : shardIds) {
-      // Per-shard rate limit: Kinesis caps GetRecords at 5 TPS per shard, so
-      // sleep until the configured min-interval has elapsed since the last
-      // call to this shard. Cap the sleep at the remaining poll budget so
-      // we don't exceed the caller's timeout.
+      // Per-shard rate limit: Kinesis caps GetRecords at 5 TPS *and* 2 MiB/s
+      // per shard. Sleep until both budgets have been replenished from the
+      // last call. Cap the sleep at the remaining poll budget so we don't
+      // exceed the caller's timeout.
       if (!awaitNextFetch(shardId, deadlineNanos)) {
         break;
       }
@@ -201,14 +209,14 @@ public class KinesisConsumer implements PubSubConsumer {
         // and skip this shard for the rest of this poll — the next poll
         // will use the fresh iterator. May redeliver delivered-but-unacked
         // records, which is consistent with the framework's at-least-once
-        // semantics.
+        // semantics. Still throttle (TPS only, zero bytes consumed) so a
+        // pathological retry loop can't slip the per-shard call cap.
         iteratorByShard.put(shardId, acquireShardIterator(shardId, resumePositionFor(shardId)));
+        recordFetch(shardId, 0L);
         continue;
       }
-      lastFetchNanosByShard.put(shardId, System.nanoTime());
+      long fetchedBytes = 0L;
       for (Record record : response.records()) {
-        String seq = record.sequenceNumber();
-        String id = shardId + ":" + seq;
         Map<String, String> attributes = new LinkedHashMap<>();
         attributes.put(ATTR_PARTITION_KEY, record.partitionKey());
         if (record.approximateArrivalTimestamp() != null) {
@@ -217,17 +225,21 @@ public class KinesisConsumer implements PubSubConsumer {
               record.approximateArrivalTimestamp().toString());
         }
         byte[] payload = record.data() == null ? new byte[0] : record.data().asByteArray();
+        fetchedBytes += payload.length;
+        String seq = record.sequenceNumber();
+        String id = shardId + ":" + seq;
         shardSeqByMessageId.put(id, new ShardSequence(shardId, seq));
         deliveredSeqsByShard
             .computeIfAbsent(shardId, k -> new TreeSet<>())
             .add(new BigInteger(seq));
         result.add(new Message(id, config.getStreamName(), payload, attributes));
       }
+      recordFetch(shardId, fetchedBytes);
       if (response.nextShardIterator() == null) {
         // Shard is closed (split/merge). A KCL-based implementation would
         // discover and start its children here; this raw-SDK cut just stops.
         iteratorByShard.remove(shardId);
-        lastFetchNanosByShard.remove(shardId);
+        nextAllowedFetchNanosByShard.remove(shardId);
       } else {
         iteratorByShard.put(shardId, response.nextShardIterator());
       }
@@ -297,7 +309,7 @@ public class KinesisConsumer implements PubSubConsumer {
       client = null;
       subscribedTopics.clear();
       iteratorByShard.clear();
-      lastFetchNanosByShard.clear();
+      nextAllowedFetchNanosByShard.clear();
       shardSeqByMessageId.clear();
       deliveredSeqsByShard.clear();
       ackedSeqsByShard.clear();
@@ -375,21 +387,21 @@ public class KinesisConsumer implements PubSubConsumer {
   }
 
   /**
-   * Sleeps until the {@link KinesisConsumerConfig#getGetRecordsMinInterval()} has elapsed since
-   * the last {@code GetRecords} call to {@code shardId}, capped at the remaining poll budget.
-   * Returns {@code true} if it's OK to call {@code GetRecords} now; {@code false} if the budget
-   * is exhausted or the thread was interrupted while waiting (caller should bail out).
+   * Sleeps until {@code shardId}'s next {@code GetRecords} call is allowed under the per-shard
+   * TPS + byte budget recorded by {@link #recordFetch(String, long)}, capped at the remaining
+   * poll budget. Returns {@code true} if it's OK to call {@code GetRecords} now; {@code false}
+   * if the poll deadline would be exceeded or the thread was interrupted while waiting.
    */
   private boolean awaitNextFetch(String shardId, long deadlineNanos) {
     if (getRecordsMinIntervalNanos <= 0) {
       return true;
     }
-    long now = System.nanoTime();
-    Long lastFetch = lastFetchNanosByShard.get(shardId);
-    if (lastFetch == null) {
+    Long earliest = nextAllowedFetchNanosByShard.get(shardId);
+    if (earliest == null) {
       return true;
     }
-    long waitNanos = lastFetch + getRecordsMinIntervalNanos - now;
+    long now = System.nanoTime();
+    long waitNanos = earliest - now;
     if (waitNanos <= 0) {
       return true;
     }
@@ -406,6 +418,31 @@ public class KinesisConsumer implements PubSubConsumer {
     // If we capped the sleep at the remaining budget, we still haven't waited
     // out the per-shard interval — bail rather than risk a throttle exception.
     return waitNanos <= remaining;
+  }
+
+  /**
+   * Records a {@code GetRecords} call against {@code shardId}'s budget. The next call is
+   * allowed only after {@code max(getRecordsMinInterval, fetchedBytes / 2 MiB-per-sec)} —
+   * Kinesis enforces both per-shard limits and exceeding either throws
+   * {@code ProvisionedThroughputExceededException}.
+   */
+  private void recordFetch(String shardId, long fetchedBytes) {
+    if (getRecordsMinIntervalNanos <= 0) {
+      return;
+    }
+    long now = System.nanoTime();
+    long tpsLimit = now + getRecordsMinIntervalNanos;
+    long bytesLimit = now + bytesToNanosAtReadRate(fetchedBytes);
+    nextAllowedFetchNanosByShard.put(shardId, Math.max(tpsLimit, bytesLimit));
+  }
+
+  private static long bytesToNanosAtReadRate(long bytes) {
+    if (bytes <= 0) {
+      return 0L;
+    }
+    // Round up so we never underestimate the wait.
+    return (bytes * 1_000_000_000L + READ_BYTES_PER_SECOND_PER_SHARD - 1)
+        / READ_BYTES_PER_SECOND_PER_SHARD;
   }
 
   private void ensureConnected() {
