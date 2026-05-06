@@ -16,6 +16,7 @@
         <kafka.version>3.7.0</kafka.version>
         <msk.auth.version>2.2.0</msk.auth.version>
         <google.cloud.pubsub.version>1.131.0</google.cloud.pubsub.version>
+        <pulsar.version>3.3.1</pulsar.version>
         <junit.version>5.10.2</junit.version>
         <mockito.version>5.11.0</mockito.version>
     </properties>
@@ -37,6 +38,12 @@
             <groupId>com.google.cloud</groupId>
             <artifactId>google-cloud-pubsub</artifactId>
             <version>${google.cloud.pubsub.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.pulsar</groupId>
+            <artifactId>pulsar-client</artifactId>
+            <version>${pulsar.version}</version>
         </dependency>
 
         <dependency>
