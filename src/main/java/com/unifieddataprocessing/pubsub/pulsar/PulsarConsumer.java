@@ -145,6 +145,12 @@ public class PulsarConsumer implements PubSubConsumer {
     int n = consumersByTopic.size();
     long perConsumerMs = Math.max(1L, timeout.toMillis() / n);
     int budget = config.getMaxMessagesPerPoll();
+    // Per-consumer message cap so a single high-traffic topic can't drain the global
+    // budget before later topics are visited. With budget=100 and n=2, each consumer
+    // is capped at 50 per poll, so a backlog on the first topic doesn't starve the
+    // second one. Math.max(1, ...) ensures every consumer gets at least one read
+    // attempt even when n > budget.
+    int perConsumerBudget = Math.max(1, budget / n);
     List<Message> out = new ArrayList<>();
 
     for (Map.Entry<String, Consumer<byte[]>> entry : consumersByTopic.entrySet()) {
@@ -153,7 +159,8 @@ public class PulsarConsumer implements PubSubConsumer {
       }
       String topic = entry.getKey();
       Consumer<byte[]> inner = entry.getValue();
-      while (out.size() < budget) {
+      int taken = 0;
+      while (taken < perConsumerBudget && out.size() < budget) {
         long remainingMs = (deadlineNs - System.nanoTime()) / 1_000_000L;
         if (remainingMs <= 0) {
           break;
@@ -169,6 +176,7 @@ public class PulsarConsumer implements PubSubConsumer {
           break;
         }
         out.add(toFrameworkMessage(msg, topic, inner));
+        taken++;
       }
     }
     return out;

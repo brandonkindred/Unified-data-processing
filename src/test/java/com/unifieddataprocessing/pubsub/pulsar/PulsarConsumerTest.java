@@ -324,6 +324,49 @@ class PulsarConsumerTest {
   }
 
   @Test
+  void poll_perConsumerBudgetPreventsHeavyTopicStarvingOthers() throws PulsarClientException {
+    // Without a per-consumer cap, a steady backlog on topic-a (the first inner consumer in
+    // insertion order) would consume the entire budget before topic-b is ever visited,
+    // starving topic-b across polls. With the cap budget/N = 4/2 = 2, topic-a is bounded
+    // at 2 messages and topic-b's single available message is delivered.
+    PulsarConsumerConfig cfg =
+        new PulsarConsumerConfig(
+            SERVICE_URL,
+            SUBSCRIPTION,
+            null,
+            null,
+            4, // maxMessagesPerPoll
+            null,
+            null,
+            null);
+    consumer = new PulsarConsumer(cfg, factory());
+    consumer.connect();
+    consumer.subscribe(TOPIC_A);
+    consumer.subscribe(TOPIC_B);
+
+    when(mockMsgA.getMessageId()).thenReturn(mockMessageIdA);
+    when(mockMsgA.getValue()).thenReturn("a".getBytes());
+    when(mockMsgA.getProperties()).thenReturn(Map.of());
+    when(mockMsgB.getMessageId()).thenReturn(mockMessageIdB);
+    when(mockMsgB.getValue()).thenReturn("b".getBytes());
+    when(mockMsgB.getProperties()).thenReturn(Map.of());
+
+    // topic-a has an unbounded backlog (always returns a message).
+    when(mockInnerA.receive(anyInt(), eq(TimeUnit.MILLISECONDS))).thenReturn(mockMsgA);
+    // topic-b has exactly one message then drains.
+    when(mockInnerB.receive(anyInt(), eq(TimeUnit.MILLISECONDS)))
+        .thenReturn(mockMsgB)
+        .thenReturn(null);
+
+    List<Message> messages = consumer.poll(Duration.ofMillis(50));
+
+    long fromA = messages.stream().filter(m -> m.getTopic().equals(TOPIC_A)).count();
+    long fromB = messages.stream().filter(m -> m.getTopic().equals(TOPIC_B)).count();
+    assertEquals(2, fromA, "topic-a should be capped at perConsumerBudget=budget/N");
+    assertEquals(1, fromB, "topic-b must not be starved by topic-a's backlog");
+  }
+
+  @Test
   void acknowledge_routesToOwnerInnerConsumer() throws PulsarClientException {
     consumer.connect();
     consumer.subscribe(TOPIC_A);
