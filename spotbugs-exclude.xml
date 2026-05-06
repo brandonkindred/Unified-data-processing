@@ -19,4 +19,9 @@
     <Method name="getExtras"/>
     <Bug pattern="EI_EXPOSE_REP"/>
   </Match>
+  <Match>
+    <Class name="com.unifieddataprocessing.pubsub.kinesis.KinesisConsumerConfig"/>
+    <Method name="getStartingPositionByShard"/>
+    <Bug pattern="EI_EXPOSE_REP"/>
+  </Match>
 </FindBugsFilter>

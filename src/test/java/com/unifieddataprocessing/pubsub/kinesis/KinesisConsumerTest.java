@@ -31,6 +31,7 @@ import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.kinesis.KinesisClient;
 import software.amazon.awssdk.services.kinesis.model.DescribeStreamSummaryRequest;
+import software.amazon.awssdk.services.kinesis.model.ExpiredIteratorException;
 import software.amazon.awssdk.services.kinesis.model.GetRecordsRequest;
 import software.amazon.awssdk.services.kinesis.model.GetRecordsResponse;
 import software.amazon.awssdk.services.kinesis.model.GetShardIteratorRequest;
@@ -421,6 +422,107 @@ class KinesisConsumerTest {
     consumer.acknowledge(messages.get(1));
     assertEquals("100", snapshot.get("shard-0"));
     assertEquals("200", consumer.getCheckpoints().get("shard-0"));
+  }
+
+  @Test
+  void subscribe_appliesPerShardStartingPositionOverrides() {
+    // Round-trip restore: caller persisted a Map<shardId, sequenceNumber> from a
+    // prior getCheckpoints(), and feeds it back via startingPositionByShard.
+    // Each shard must get a GetShardIterator call with its own AFTER_SEQUENCE_NUMBER;
+    // shards not present in the map fall back to the global startingPosition.
+    KinesisConsumerConfig restored =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ZERO,
+            Map.of(
+                "shard-0", KinesisStartingPosition.afterSequenceNumber("100"),
+                "shard-1", KinesisStartingPosition.afterSequenceNumber("200")));
+    KinesisConsumer restoredConsumer = new KinesisConsumer(restored, c -> mockClient);
+    restoredConsumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(
+                    Shard.builder().shardId("shard-0").build(),
+                    Shard.builder().shardId("shard-1").build(),
+                    Shard.builder().shardId("shard-2").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER").build());
+
+    restoredConsumer.subscribe(STREAM);
+
+    ArgumentCaptor<GetShardIteratorRequest> captor =
+        ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+    verify(mockClient, times(3)).getShardIterator(captor.capture());
+    Map<String, GetShardIteratorRequest> byShard = new java.util.HashMap<>();
+    captor.getAllValues().forEach(r -> byShard.put(r.shardId(), r));
+
+    assertEquals(
+        ShardIteratorType.AFTER_SEQUENCE_NUMBER,
+        byShard.get("shard-0").shardIteratorType());
+    assertEquals("100", byShard.get("shard-0").startingSequenceNumber());
+
+    assertEquals(
+        ShardIteratorType.AFTER_SEQUENCE_NUMBER,
+        byShard.get("shard-1").shardIteratorType());
+    assertEquals("200", byShard.get("shard-1").startingSequenceNumber());
+
+    // shard-2 is not in the override map → global default (TRIM_HORIZON).
+    assertEquals(ShardIteratorType.TRIM_HORIZON, byShard.get("shard-2").shardIteratorType());
+    assertNull(byShard.get("shard-2").startingSequenceNumber());
+  }
+
+  @Test
+  void poll_recoversFromExpiredShardIterator() {
+    // Simulate >5 min of idleness: GetRecords throws ExpiredIteratorException.
+    // The consumer must reacquire a fresh iterator from the latest checkpoint
+    // (or the configured starting position if none) and continue without
+    // requiring the caller to recreate the consumer.
+    consumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-INITIAL").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-AFTER-EXPIRY").build());
+    Record record =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder().records(record).nextShardIterator("ITER-1").build())
+        .thenThrow(ExpiredIteratorException.builder().message("expired").build())
+        .thenReturn(GetRecordsResponse.builder().nextShardIterator("ITER-2").build());
+    consumer.subscribe(STREAM);
+
+    // First poll succeeds; ack to advance the watermark to 100.
+    List<Message> first = consumer.poll(Duration.ofMillis(50));
+    consumer.acknowledge(first.get(0));
+    assertEquals("100", consumer.getCheckpoints().get("shard-0"));
+
+    // Second poll: GetRecords throws ExpiredIteratorException → reacquire and skip.
+    assertTrue(consumer.poll(Duration.ofMillis(50)).isEmpty());
+
+    // Third poll uses the new iterator without throwing.
+    consumer.poll(Duration.ofMillis(50));
+
+    // Verify the reacquire used AFTER_SEQUENCE_NUMBER with the latest watermark.
+    ArgumentCaptor<GetShardIteratorRequest> captor =
+        ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+    verify(mockClient, times(2)).getShardIterator(captor.capture());
+    GetShardIteratorRequest reacquire = captor.getAllValues().get(1);
+    assertEquals(ShardIteratorType.AFTER_SEQUENCE_NUMBER, reacquire.shardIteratorType());
+    assertEquals("100", reacquire.startingSequenceNumber());
   }
 
   @Test

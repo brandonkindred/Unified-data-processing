@@ -1,6 +1,9 @@
 package com.unifieddataprocessing.pubsub.kinesis;
 
 import java.time.Duration;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -26,6 +29,7 @@ public final class KinesisConsumerConfig {
   private final KinesisStartingPosition startingPosition;
   private final int getRecordsLimit;
   private final Duration getRecordsMinInterval;
+  private final Map<String, KinesisStartingPosition> startingPositionByShard;
 
   /** Creates a config with {@link KinesisStartingPosition#latest()} and all defaults. */
   public KinesisConsumerConfig(
@@ -36,7 +40,8 @@ public final class KinesisConsumerConfig {
         credentialsProvider,
         KinesisStartingPosition.latest(),
         DEFAULT_GET_RECORDS_LIMIT,
-        DEFAULT_GET_RECORDS_MIN_INTERVAL);
+        DEFAULT_GET_RECORDS_MIN_INTERVAL,
+        Collections.emptyMap());
   }
 
   /** Convenience constructor using {@link #DEFAULT_GET_RECORDS_MIN_INTERVAL}. */
@@ -52,14 +57,11 @@ public final class KinesisConsumerConfig {
         credentialsProvider,
         startingPosition,
         getRecordsLimit,
-        DEFAULT_GET_RECORDS_MIN_INTERVAL);
+        DEFAULT_GET_RECORDS_MIN_INTERVAL,
+        Collections.emptyMap());
   }
 
-  /**
-   * Full configuration. {@code getRecordsLimit} must be in {@code (0, 10000]} (Kinesis's
-   * GetRecords cap). {@code getRecordsMinInterval} must be non-null and non-negative;
-   * {@link Duration#ZERO} disables per-shard throttling.
-   */
+  /** Convenience constructor with no per-shard starting-position overrides. */
   public KinesisConsumerConfig(
       String streamName,
       Region region,
@@ -67,6 +69,35 @@ public final class KinesisConsumerConfig {
       KinesisStartingPosition startingPosition,
       int getRecordsLimit,
       Duration getRecordsMinInterval) {
+    this(
+        streamName,
+        region,
+        credentialsProvider,
+        startingPosition,
+        getRecordsLimit,
+        getRecordsMinInterval,
+        Collections.emptyMap());
+  }
+
+  /**
+   * Full configuration. {@code getRecordsLimit} must be in {@code (0, 10000]} (Kinesis's
+   * GetRecords cap). {@code getRecordsMinInterval} must be non-null and non-negative;
+   * {@link Duration#ZERO} disables per-shard throttling.
+   *
+   * <p>{@code startingPositionByShard} lets multi-shard streams resume each shard from its own
+   * checkpoint (round-tripped via {@link KinesisConsumer#getCheckpoints()}). Shards not present
+   * in the map fall back to {@code startingPosition}; new shards introduced by resharding after
+   * the checkpoints were taken therefore start from the configured global default. May be
+   * {@code null} (treated as empty).
+   */
+  public KinesisConsumerConfig(
+      String streamName,
+      Region region,
+      AwsCredentialsProvider credentialsProvider,
+      KinesisStartingPosition startingPosition,
+      int getRecordsLimit,
+      Duration getRecordsMinInterval,
+      Map<String, KinesisStartingPosition> startingPositionByShard) {
     this.streamName = Objects.requireNonNull(streamName, "streamName");
     this.region = Objects.requireNonNull(region, "region");
     this.credentialsProvider = Objects.requireNonNull(credentialsProvider, "credentialsProvider");
@@ -81,6 +112,10 @@ public final class KinesisConsumerConfig {
       throw new IllegalArgumentException("getRecordsMinInterval must not be negative");
     }
     this.getRecordsMinInterval = getRecordsMinInterval;
+    this.startingPositionByShard =
+        startingPositionByShard == null
+            ? Collections.emptyMap()
+            : Collections.unmodifiableMap(new LinkedHashMap<>(startingPositionByShard));
   }
 
   public String getStreamName() {
@@ -105,5 +140,9 @@ public final class KinesisConsumerConfig {
 
   public Duration getGetRecordsMinInterval() {
     return getRecordsMinInterval;
+  }
+
+  public Map<String, KinesisStartingPosition> getStartingPositionByShard() {
+    return startingPositionByShard;
   }
 }

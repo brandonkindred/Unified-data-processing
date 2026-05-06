@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import software.amazon.awssdk.services.kinesis.KinesisClient;
 import software.amazon.awssdk.services.kinesis.model.DescribeStreamSummaryRequest;
+import software.amazon.awssdk.services.kinesis.model.ExpiredIteratorException;
 import software.amazon.awssdk.services.kinesis.model.GetRecordsRequest;
 import software.amazon.awssdk.services.kinesis.model.GetRecordsResponse;
 import software.amazon.awssdk.services.kinesis.model.GetShardIteratorRequest;
@@ -139,7 +140,9 @@ public class KinesisConsumer implements PubSubConsumer {
       return;
     }
     for (Shard shard : listAllShards()) {
-      iteratorByShard.put(shard.shardId(), acquireShardIterator(shard.shardId()));
+      iteratorByShard.put(
+          shard.shardId(),
+          acquireShardIterator(shard.shardId(), startingPositionFor(shard.shardId())));
     }
   }
 
@@ -173,12 +176,25 @@ public class KinesisConsumer implements PubSubConsumer {
         break;
       }
       String iterator = iteratorByShard.get(shardId);
-      GetRecordsResponse response =
-          client.getRecords(
-              GetRecordsRequest.builder()
-                  .shardIterator(iterator)
-                  .limit(config.getGetRecordsLimit())
-                  .build());
+      GetRecordsResponse response;
+      try {
+        response =
+            client.getRecords(
+                GetRecordsRequest.builder()
+                    .shardIterator(iterator)
+                    .limit(config.getGetRecordsLimit())
+                    .build());
+      } catch (ExpiredIteratorException e) {
+        // Iterators expire after 5 minutes of idleness. Reacquire from the
+        // highest acked sequence (so we don't redeliver acked records) or
+        // the configured starting position if no progress has been made,
+        // and skip this shard for the rest of this poll — the next poll
+        // will use the fresh iterator. May redeliver delivered-but-unacked
+        // records, which is consistent with the framework's at-least-once
+        // semantics.
+        iteratorByShard.put(shardId, acquireShardIterator(shardId, resumePositionFor(shardId)));
+        continue;
+      }
       lastFetchNanosByShard.put(shardId, System.nanoTime());
       for (Record record : response.records()) {
         String seq = record.sequenceNumber();
@@ -309,21 +325,43 @@ public class KinesisConsumer implements PubSubConsumer {
     return shards;
   }
 
-  private String acquireShardIterator(String shardId) {
-    KinesisStartingPosition pos = config.getStartingPosition();
+  private String acquireShardIterator(String shardId, KinesisStartingPosition position) {
     GetShardIteratorRequest.Builder req =
         GetShardIteratorRequest.builder()
             .streamName(config.getStreamName())
             .shardId(shardId)
-            .shardIteratorType(pos.getType());
-    if (pos.getTimestamp() != null) {
-      req.timestamp(pos.getTimestamp());
+            .shardIteratorType(position.getType());
+    if (position.getTimestamp() != null) {
+      req.timestamp(position.getTimestamp());
     }
-    if (pos.getSequenceNumber() != null) {
-      req.startingSequenceNumber(pos.getSequenceNumber());
+    if (position.getSequenceNumber() != null) {
+      req.startingSequenceNumber(position.getSequenceNumber());
     }
     GetShardIteratorResponse resp = client.getShardIterator(req.build());
     return resp.shardIterator();
+  }
+
+  /**
+   * Initial starting position for {@code shardId} on first subscribe — the per-shard override
+   * if one was supplied (e.g. restored from a prior {@link #getCheckpoints()} snapshot),
+   * otherwise the config's global default.
+   */
+  private KinesisStartingPosition startingPositionFor(String shardId) {
+    KinesisStartingPosition perShard = config.getStartingPositionByShard().get(shardId);
+    return perShard != null ? perShard : config.getStartingPosition();
+  }
+
+  /**
+   * Position to resume from after an iterator expires: the highest acked sequence (so already
+   * acked records are not redelivered), falling back to the initial starting position when no
+   * progress has been recorded.
+   */
+  private KinesisStartingPosition resumePositionFor(String shardId) {
+    BigInteger watermark = highWatermarkByShard.get(shardId);
+    if (watermark != null) {
+      return KinesisStartingPosition.afterSequenceNumber(watermark.toString());
+    }
+    return startingPositionFor(shardId);
   }
 
   /**
