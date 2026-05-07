@@ -55,9 +55,13 @@ public final class PublishResult {
     return new PublishResult(messageId, topic, null, null, shardId, sequenceNumber, null);
   }
 
-  /** Result for a Pulsar {@code sendAsync}; {@code sequenceNumber} is producer-scoped. */
-  public static PublishResult forPulsar(String topic, String messageId, String sequenceNumber) {
-    return new PublishResult(messageId, topic, null, null, null, sequenceNumber, null);
+  /**
+   * Result for a Pulsar {@code sendAsync}; {@code messageId} encodes the broker-assigned position
+   * (ledger:entry:partition:batch). The producer-side sequence id is intentionally not surfaced
+   * here — it is producer-scoped and racy to read from the async callback under in-flight sends.
+   */
+  public static PublishResult forPulsar(String topic, String messageId) {
+    return new PublishResult(messageId, topic, null, null, null, null, null);
   }
 
   public String getMessageId() {
@@ -83,7 +87,7 @@ public final class PublishResult {
     return shardId;
   }
 
-  /** Kinesis sequence number or Pulsar producer sequence; {@code null} otherwise. */
+  /** Kinesis sequence number; {@code null} otherwise. */
   public String getSequenceNumber() {
     return sequenceNumber;
   }

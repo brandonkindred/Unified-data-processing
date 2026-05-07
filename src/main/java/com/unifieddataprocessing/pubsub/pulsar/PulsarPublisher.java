@@ -176,7 +176,6 @@ public class PulsarPublisher implements PubSubPublisher {
         }
         producersByTopic.put(topic, producer);
       }
-      Producer<byte[]> p = producer;
       TypedMessageBuilder<byte[]> builder = producer.newMessage(Schema.BYTES);
       builder.value(message.getPayload());
       if (!message.getAttributes().isEmpty()) {
@@ -190,11 +189,11 @@ public class PulsarPublisher implements PubSubPublisher {
                   cf.completeExceptionally(t);
                   return;
                 }
-                cf.complete(
-                    PublishResult.forPulsar(
-                        topic,
-                        topic + "-" + mid.toString(),
-                        String.valueOf(p.getLastSequenceId())));
+                // Pulsar MessageId encodes the broker-assigned position (ledger:entry:partition:
+                // batch); the producer's getLastSequenceId() is intentionally NOT read here — it
+                // is producer-scoped and racy under in-flight sends, since this callback may fire
+                // after later messages on the same producer have already been queued.
+                cf.complete(PublishResult.forPulsar(topic, topic + "-" + mid.toString()));
               });
     } catch (RuntimeException e) {
       cf.completeExceptionally(e);

@@ -2,6 +2,7 @@ package com.unifieddataprocessing.pubsub.pulsar;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -155,7 +156,6 @@ class PulsarPublisherTest {
     stubBuilder(mockProducerA, mockBuilderA);
     when(mockBuilderA.sendAsync()).thenReturn(CompletableFuture.completedFuture(mockMessageIdA));
     when(mockMessageIdA.toString()).thenReturn("msg-1");
-    when(mockProducerA.getLastSequenceId()).thenReturn(42L);
 
     Message m = new Message("a", TOPIC_A, "payload".getBytes(), Map.of("k", "v"));
     final CompletableFuture<PublishResult> future = publisher.publish(m);
@@ -171,8 +171,38 @@ class PulsarPublisherTest {
     PublishResult r = future.get();
 
     assertEquals(TOPIC_A + "-msg-1", r.getMessageId());
-    assertEquals("42", r.getSequenceNumber());
     assertEquals(TOPIC_A, r.getTopic());
+    // sequenceNumber intentionally not surfaced for Pulsar — see PublishResult.forPulsar javadoc
+    // and PulsarPublisher.doPublish (the producer-side counter is racy under in-flight sends).
+    assertNull(r.getSequenceNumber());
+  }
+
+  @Test
+  void publish_messageIdIsCapturedFromAck_notFromLaterSends() throws Exception {
+    // Regression for the race that motivated dropping getLastSequenceId(): when two sends are in
+    // flight on the same producer, the first ack's PublishResult must reflect THAT send's
+    // MessageId, not whatever later state the producer has accumulated. Verifies by completing
+    // futures out of order and asserting each result carries its own MessageId.
+    publisher.connect();
+    stubBuilder(mockProducerA, mockBuilderA);
+    final CompletableFuture<MessageId> ack1 = new CompletableFuture<>();
+    final CompletableFuture<MessageId> ack2 = new CompletableFuture<>();
+    when(mockBuilderA.sendAsync()).thenReturn(ack1, ack2);
+    when(mockMessageIdA.toString()).thenReturn("first");
+    when(mockMessageIdB.toString()).thenReturn("second");
+
+    final CompletableFuture<PublishResult> r1 =
+        publisher.publish(new Message("a", TOPIC_A, new byte[] {1}, null));
+    final CompletableFuture<PublishResult> r2 =
+        publisher.publish(new Message("b", TOPIC_A, new byte[] {2}, null));
+
+    // Complete the SECOND send's ack first, then the first — out-of-order completion is the
+    // exact scenario where reading getLastSequenceId() on r1's callback would see r2's value.
+    ack2.complete(mockMessageIdB);
+    ack1.complete(mockMessageIdA);
+
+    assertEquals(TOPIC_A + "-first", r1.get().getMessageId());
+    assertEquals(TOPIC_A + "-second", r2.get().getMessageId());
   }
 
   @Test
