@@ -132,6 +132,12 @@ public class KinesisConsumer implements PubSubConsumer {
       }
       throw e;
     }
+    // Reset any watermarks retained from a prior session — close() keeps them
+    // around so callers can persist them via getCheckpoints(), but they're
+    // stale on reconnect. Letting them bleed into the new session would let
+    // resumePositionFor() reacquire on AFTER_SEQUENCE_NUMBER from a pre-close
+    // checkpoint and skip records the new starting position should deliver.
+    highWatermarkByShard.clear();
     client = newClient;
   }
 

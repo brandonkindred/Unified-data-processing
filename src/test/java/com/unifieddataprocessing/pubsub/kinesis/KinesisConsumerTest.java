@@ -452,6 +452,28 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void connect_resetsRetainedCheckpointsFromPriorSession() {
+    // close() retains highWatermarkByShard so callers can persist it via
+    // getCheckpoints(); the watermark must NOT bleed into a subsequent
+    // connect() — a TRIM_HORIZON subscription that hits an expired iterator
+    // would otherwise reacquire AFTER_SEQUENCE_NUMBER on the stale watermark
+    // and skip records the new session should deliver.
+    consumer.connect();
+    seedTwoMessagesOnShard("shard-0", "100", "105");
+    List<Message> messages = consumer.poll(Duration.ofMillis(50));
+    consumer.acknowledge(messages.get(0));
+    consumer.acknowledge(messages.get(1));
+    assertEquals("105", consumer.getCheckpoints().get("shard-0"));
+
+    consumer.close();
+    // Persistence path: getCheckpoints() still works after close.
+    assertEquals("105", consumer.getCheckpoints().get("shard-0"));
+
+    consumer.connect();
+    assertNull(consumer.getCheckpoints().get("shard-0"));
+  }
+
+  @Test
   void close_isIdempotentAndClosesUnderlyingClient() {
     consumer.connect();
     consumer.close();
