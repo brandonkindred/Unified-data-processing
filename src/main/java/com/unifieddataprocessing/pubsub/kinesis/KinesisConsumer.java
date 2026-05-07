@@ -186,8 +186,17 @@ public class KinesisConsumer implements PubSubConsumer {
     }
     long deadlineNanos = System.nanoTime() + timeout.toNanos();
     List<Message> result = new ArrayList<>();
-    // Snapshot the keys; we may remove closed shards mid-iteration.
+    // Visit shards by ascending nextAllowedFetchNanos so ready shards run
+    // first; otherwise a heavily-throttled shard could consume the entire
+    // poll budget while ready shards behind it sit idle. Snapshot the keys
+    // (we may remove closed shards mid-iteration). Shards with no recorded
+    // fetch sort first (default 0L).
     List<String> shardIds = new ArrayList<>(iteratorByShard.keySet());
+    shardIds.sort(
+        (a, b) ->
+            Long.compare(
+                nextAllowedFetchNanosByShard.getOrDefault(a, 0L),
+                nextAllowedFetchNanosByShard.getOrDefault(b, 0L)));
     for (String shardId : shardIds) {
       // Per-shard rate limit: Kinesis caps GetRecords at 5 TPS *and* 2 MiB/s
       // per shard. Sleep until both budgets have been replenished from the
@@ -443,6 +452,15 @@ public class KinesisConsumer implements PubSubConsumer {
    * if the poll deadline would be exceeded or the thread was interrupted while waiting.
    */
   private boolean awaitNextFetch(String shardId, long deadlineNanos) {
+    long now = System.nanoTime();
+    // Bound the entire poll() by the caller's deadline: don't issue more
+    // synchronous GetRecords calls once the budget is exhausted, even for
+    // shards that are otherwise ready to fetch. Without this, a slow AWS
+    // call on an earlier shard could leave a small timeout exhausted while
+    // the loop kept firing GetRecords on every later shard.
+    if (now >= deadlineNanos) {
+      return false;
+    }
     if (getRecordsMinIntervalNanos <= 0) {
       return true;
     }
@@ -450,15 +468,11 @@ public class KinesisConsumer implements PubSubConsumer {
     if (earliest == null) {
       return true;
     }
-    long now = System.nanoTime();
     long waitNanos = earliest - now;
     if (waitNanos <= 0) {
       return true;
     }
     long remaining = deadlineNanos - now;
-    if (remaining <= 0) {
-      return false;
-    }
     try {
       TimeUnit.NANOSECONDS.sleep(Math.min(waitNanos, remaining));
     } catch (InterruptedException e) {

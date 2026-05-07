@@ -684,14 +684,14 @@ class KinesisConsumerTest {
 
     // No partial state: a poll should not call GetRecords for any shard,
     // because nothing was added to iteratorByShard.
-    assertTrue(consumer.poll(Duration.ZERO).isEmpty());
+    assertTrue(consumer.poll(Duration.ofMillis(50)).isEmpty());
     verify(mockClient, never()).getRecords(any(GetRecordsRequest.class));
 
     // Retry succeeds — both shards now subscribed; the next poll fetches both.
     when(mockClient.getRecords(any(GetRecordsRequest.class)))
         .thenReturn(GetRecordsResponse.builder().nextShardIterator("X").build());
     consumer.subscribe(STREAM);
-    consumer.poll(Duration.ZERO);
+    consumer.poll(Duration.ofMillis(50));
     verify(mockClient, times(2)).getRecords(any(GetRecordsRequest.class));
   }
 
@@ -834,6 +834,27 @@ class KinesisConsumerTest {
     assertTrue(
         elapsedMs >= 220,
         "Expected ~250ms byte-based throttle after a 500 KiB response, observed " + elapsedMs);
+  }
+
+  @Test
+  void poll_respectsExhaustedDeadlineBeforeIssuingGetRecords() {
+    // Polling with a zero (or already-past) deadline must NOT issue any
+    // GetRecords on subscribed shards — synchronous SDK calls take time and
+    // would blow past the caller's stated timeout. (The setup uses
+    // Duration.ZERO for the throttle, so this exercises the deadline path
+    // independent of the throttle logic.)
+    consumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER").build());
+    consumer.subscribe(STREAM);
+
+    assertTrue(consumer.poll(Duration.ZERO).isEmpty());
+    verify(mockClient, never()).getRecords(any(GetRecordsRequest.class));
   }
 
   @Test
