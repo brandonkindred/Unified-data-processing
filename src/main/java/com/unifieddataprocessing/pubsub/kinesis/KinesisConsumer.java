@@ -311,7 +311,12 @@ public class KinesisConsumer implements PubSubConsumer {
       }
     }
     if (highestPrefix != null) {
-      highWatermarkByShard.put(ss.shardId(), highestPrefix);
+      // Watermark advances monotonically. Without merge() this could regress
+      // when a session unsubscribes and re-subscribes (without close), since
+      // the retained watermark plus a re-delivery of older records would let
+      // a small post-resubscribe prefix overwrite a larger pre-unsubscribe
+      // one — corrupting getCheckpoints() for downstream persistence.
+      highWatermarkByShard.merge(ss.shardId(), highestPrefix, BigInteger::max);
       delivered.headSet(highestPrefix, true).clear();
       acked.headSet(highestPrefix, true).clear();
     }

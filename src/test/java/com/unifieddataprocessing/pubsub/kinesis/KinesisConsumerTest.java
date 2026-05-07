@@ -474,6 +474,57 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void acknowledge_keepsCheckpointMonotonicAcrossUnsubscribeResubscribe() {
+    // After acking through seq=105, an unsubscribe+resubscribe with a
+    // re-delivery of older records (e.g. TRIM_HORIZON) must NOT regress the
+    // checkpoint — acking a smaller delivered prefix on the new session
+    // should leave highWatermarkByShard at the prior maximum.
+    consumer.connect();
+    seedTwoMessagesOnShard("shard-0", "100", "105");
+    List<Message> first = consumer.poll(Duration.ofMillis(50));
+    consumer.acknowledge(first.get(0));
+    consumer.acknowledge(first.get(1));
+    assertEquals("105", consumer.getCheckpoints().get("shard-0"));
+
+    // Unsubscribe and re-subscribe; iterators are reacquired and the same
+    // records are delivered again (same id format → re-enters side-maps).
+    consumer.unsubscribe(STREAM);
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-RESUBSCRIBE").build());
+    Record r100 =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    Record r105 =
+        Record.builder()
+            .sequenceNumber("105")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("b"))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder()
+                .records(r100, r105)
+                .nextShardIterator("ITER-NEXT")
+                .build());
+    consumer.subscribe(STREAM);
+    List<Message> second = consumer.poll(Duration.ofMillis(50));
+    assertEquals(2, second.size());
+
+    // Ack just the lower seq on the new session — the checkpoint must stay
+    // at the prior max ("105"), not regress to "100".
+    consumer.acknowledge(second.get(0));
+    assertEquals("105", consumer.getCheckpoints().get("shard-0"));
+  }
+
+  @Test
   void close_isIdempotentAndClosesUnderlyingClient() {
     consumer.connect();
     consumer.close();
