@@ -533,6 +533,10 @@ class KinesisConsumerTest {
 
   @Test
   void subscribe_filtersListShardsToTimestampWhenStartingAtTimestamp() {
+    // Use FROM_TIMESTAMP rather than AT_TIMESTAMP so a stream resharded
+    // after the configured time still surfaces its current shards
+    // (AT_TIMESTAMP would only return shards open at that exact moment, and
+    // we don't dynamically discover children of closed shards).
     Instant ts = Instant.parse("2026-01-01T00:00:00Z");
     KinesisConsumerConfig tsConfig =
         new KinesisConsumerConfig(
@@ -558,7 +562,7 @@ class KinesisConsumerTest {
     verify(mockClient).listShards(captor.capture());
     ListShardsRequest req = captor.getValue();
     assertNotNull(req.shardFilter());
-    assertEquals(ShardFilterType.AT_TIMESTAMP, req.shardFilter().type());
+    assertEquals(ShardFilterType.FROM_TIMESTAMP, req.shardFilter().type());
     assertEquals(ts, req.shardFilter().timestamp());
   }
 

@@ -392,8 +392,15 @@ public class KinesisConsumer implements PubSubConsumer {
     return switch (pos.getType()) {
       case LATEST -> ShardFilter.builder().type(ShardFilterType.AT_LATEST).build();
       case AT_TIMESTAMP ->
+          // FROM_TIMESTAMP includes closed shards that ended after the
+          // timestamp *and* all currently-open shards. AT_TIMESTAMP only
+          // returns shards open at that exact moment; if the stream
+          // resharded after the timestamp, the children opened later would
+          // be excluded and we'd silently miss their records once the
+          // parent closes (we drop closed shards rather than discovering
+          // children — that's deferred to a KCL-based impl).
           ShardFilter.builder()
-              .type(ShardFilterType.AT_TIMESTAMP)
+              .type(ShardFilterType.FROM_TIMESTAMP)
               .timestamp(pos.getTimestamp())
               .build();
       // TRIM_HORIZON's default matches FROM_TRIM_HORIZON. Sequence-number
