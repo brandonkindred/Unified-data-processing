@@ -2,6 +2,7 @@ package com.unifieddataprocessing.pubsub.kinesis;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -41,6 +42,7 @@ import software.amazon.awssdk.services.kinesis.model.ListShardsRequest;
 import software.amazon.awssdk.services.kinesis.model.ListShardsResponse;
 import software.amazon.awssdk.services.kinesis.model.Record;
 import software.amazon.awssdk.services.kinesis.model.Shard;
+import software.amazon.awssdk.services.kinesis.model.ShardFilterType;
 import software.amazon.awssdk.services.kinesis.model.ShardIteratorType;
 
 @ExtendWith(MockitoExtension.class)
@@ -472,6 +474,89 @@ class KinesisConsumerTest {
     consumer.acknowledge(messages.get(1));
     assertEquals("100", snapshot.get("shard-0"));
     assertEquals("200", consumer.getCheckpoints().get("shard-0"));
+  }
+
+  @Test
+  void subscribe_filtersListShardsToOpenWhenStartingAtLatest() {
+    // With LATEST, we don't want iterators for closed historical shards
+    // (they'd just cost a GetShardIterator + GetRecords roundtrip and get
+    // immediately dropped). Pass ShardFilter(AT_LATEST) so Kinesis only
+    // returns currently-open shards.
+    KinesisConsumerConfig latestConfig =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.latest(),
+            100,
+            Duration.ZERO);
+    KinesisConsumer latestConsumer = new KinesisConsumer(latestConfig, c -> mockClient);
+    latestConsumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER").build());
+
+    latestConsumer.subscribe(STREAM);
+
+    ArgumentCaptor<ListShardsRequest> captor = ArgumentCaptor.forClass(ListShardsRequest.class);
+    verify(mockClient).listShards(captor.capture());
+    ListShardsRequest req = captor.getValue();
+    assertNotNull(req.shardFilter());
+    assertEquals(ShardFilterType.AT_LATEST, req.shardFilter().type());
+  }
+
+  @Test
+  void subscribe_filtersListShardsToTimestampWhenStartingAtTimestamp() {
+    Instant ts = Instant.parse("2026-01-01T00:00:00Z");
+    KinesisConsumerConfig tsConfig =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.atTimestamp(ts),
+            100,
+            Duration.ZERO);
+    KinesisConsumer tsConsumer = new KinesisConsumer(tsConfig, c -> mockClient);
+    tsConsumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER").build());
+
+    tsConsumer.subscribe(STREAM);
+
+    ArgumentCaptor<ListShardsRequest> captor = ArgumentCaptor.forClass(ListShardsRequest.class);
+    verify(mockClient).listShards(captor.capture());
+    ListShardsRequest req = captor.getValue();
+    assertNotNull(req.shardFilter());
+    assertEquals(ShardFilterType.AT_TIMESTAMP, req.shardFilter().type());
+    assertEquals(ts, req.shardFilter().timestamp());
+  }
+
+  @Test
+  void subscribe_doesNotFilterListShardsForTrimHorizon() {
+    // setUp uses TRIM_HORIZON; the default Kinesis behavior already matches.
+    consumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER").build());
+
+    consumer.subscribe(STREAM);
+
+    ArgumentCaptor<ListShardsRequest> captor = ArgumentCaptor.forClass(ListShardsRequest.class);
+    verify(mockClient).listShards(captor.capture());
+    assertNull(captor.getValue().shardFilter());
   }
 
   @Test

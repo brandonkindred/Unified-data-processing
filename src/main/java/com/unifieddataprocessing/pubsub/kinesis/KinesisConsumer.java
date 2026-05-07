@@ -28,6 +28,8 @@ import software.amazon.awssdk.services.kinesis.model.ListShardsRequest;
 import software.amazon.awssdk.services.kinesis.model.ListShardsResponse;
 import software.amazon.awssdk.services.kinesis.model.Record;
 import software.amazon.awssdk.services.kinesis.model.Shard;
+import software.amazon.awssdk.services.kinesis.model.ShardFilter;
+import software.amazon.awssdk.services.kinesis.model.ShardFilterType;
 
 /**
  * Amazon Kinesis Data Streams-backed {@link PubSubConsumer}. Wraps a synchronous {@link
@@ -336,10 +338,18 @@ public class KinesisConsumer implements PubSubConsumer {
   private List<Shard> listAllShards() {
     List<Shard> shards = new ArrayList<>();
     String nextToken = null;
+    ShardFilter filter = buildShardFilter();
     do {
       ListShardsRequest.Builder req = ListShardsRequest.builder();
       if (nextToken == null) {
+        // First page: scope by stream name and (optionally) a shard filter so
+        // we don't acquire iterators for closed historical shards that aren't
+        // relevant to the configured starting position. Per the API spec,
+        // ShardFilter cannot accompany NextToken on subsequent pages.
         req.streamName(config.getStreamName());
+        if (filter != null) {
+          req.shardFilter(filter);
+        }
       } else {
         req.nextToken(nextToken);
       }
@@ -348,6 +358,33 @@ public class KinesisConsumer implements PubSubConsumer {
       nextToken = resp.nextToken();
     } while (nextToken != null);
     return shards;
+  }
+
+  /**
+   * Translates the global {@link KinesisStartingPosition} into a stream-wide {@link ShardFilter}
+   * that ListShards can use to drop irrelevant closed shards. Returns {@code null} when no
+   * filter applies — either the default {@code FROM_TRIM_HORIZON} matches our intent, or the
+   * starting position is per-shard and a stream-wide filter would over-prune.
+   */
+  private ShardFilter buildShardFilter() {
+    // With per-shard overrides, the caller is targeting specific shards
+    // (typically restoring from checkpoints) and may want closed shards
+    // included. Skip the filter and let listAllShards return everything.
+    if (!config.getStartingPositionByShard().isEmpty()) {
+      return null;
+    }
+    KinesisStartingPosition pos = config.getStartingPosition();
+    return switch (pos.getType()) {
+      case LATEST -> ShardFilter.builder().type(ShardFilterType.AT_LATEST).build();
+      case AT_TIMESTAMP ->
+          ShardFilter.builder()
+              .type(ShardFilterType.AT_TIMESTAMP)
+              .timestamp(pos.getTimestamp())
+              .build();
+      // TRIM_HORIZON's default matches FROM_TRIM_HORIZON. Sequence-number
+      // positions are per-shard, so no stream-wide filter is meaningful.
+      default -> null;
+    };
   }
 
   private String acquireShardIterator(String shardId, KinesisStartingPosition position) {
