@@ -19,6 +19,7 @@ import com.google.pubsub.v1.TopicName;
 import com.unifieddataprocessing.pubsub.Message;
 import com.unifieddataprocessing.pubsub.PublishBatchException;
 import com.unifieddataprocessing.pubsub.PublishResult;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -202,6 +203,40 @@ class GcpPubSubPublisherTest {
     PublishBatchException pbe = (PublishBatchException) ee.getCause();
     assertEquals(2, pbe.getSucceeded().size());
     assertSame(error, pbe.getFailures().get(1));
+  }
+
+  @Test
+  void publishBatch_publisherBuildFailureBecomesAggregatedFailure() {
+    // First topic builds OK; second topic's factory throws (e.g. Publisher.Builder.build()
+    // raised IOException and the factory wrapped it in UncheckedIOException). The third
+    // message reuses the cached publisher for the first topic and must still publish — the
+    // sync failure on the middle entry must not abort batch submission.
+    GcpPubSubPublisherConfig config = new GcpPubSubPublisherConfig("my-proj");
+    UncheckedIOException buildError = new UncheckedIOException(new java.io.IOException("build"));
+    GcpPubSubPublisher p =
+        new GcpPubSubPublisher(
+            config,
+            tn -> {
+              if ("topic-a".equals(tn.getTopic())) {
+                return mockPublisherA;
+              }
+              throw buildError;
+            });
+    p.connect();
+    SettableApiFuture<String> ack = SettableApiFuture.create();
+    ack.set("ok");
+    when(mockPublisherA.publish(any(PubsubMessage.class))).thenReturn(ack);
+
+    Message m1 = new Message("a", "topic-a", new byte[] {1}, null);
+    Message m2 = new Message("b", "topic-b", new byte[] {2}, null);
+    Message m3 = new Message("c", "topic-a", new byte[] {3}, null);
+
+    CompletableFuture<List<PublishResult>> batch = p.publishBatch(List.of(m1, m2, m3));
+    ExecutionException ee = assertThrows(ExecutionException.class, batch::get);
+    PublishBatchException pbe = (PublishBatchException) ee.getCause();
+    assertEquals(2, pbe.getSucceeded().size());
+    assertSame(buildError, pbe.getFailures().get(1));
+    verify(mockPublisherA, times(2)).publish(any(PubsubMessage.class));
   }
 
   @Test

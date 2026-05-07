@@ -198,25 +198,36 @@ public class KinesisPublisher implements PubSubPublisher {
   }
 
   private CompletableFuture<PublishResult> doPublish(Message message) {
-    String stream = message.getTopic();
-    String partitionKey = resolvePartitionKey(message);
-    PutRecordRequest request =
-        PutRecordRequest.builder()
-            .streamName(stream)
-            .partitionKey(partitionKey)
-            .data(SdkBytes.fromByteArray(message.getPayload()))
-            .build();
-    CompletableFuture<PublishResult> cf =
-        CompletableFuture.supplyAsync(
-            () -> {
-              PutRecordResponse response = client.putRecord(request);
-              String id = response.shardId() + ":" + response.sequenceNumber();
-              return PublishResult.forKinesis(
-                  stream, id, response.shardId(), response.sequenceNumber());
-            },
-            executor);
+    CompletableFuture<PublishResult> cf = new CompletableFuture<>();
     inflight.add(cf);
     cf.whenComplete((r, t) -> inflight.remove(cf));
+    // Funnel any synchronous failure (request-build error, RejectedExecutionException from a
+    // saturated executor, etc.) into the future so publishBatch's aggregate contract holds —
+    // siblings keep submitting and failures are reported via PublishBatchException.
+    try {
+      String stream = message.getTopic();
+      String partitionKey = resolvePartitionKey(message);
+      PutRecordRequest request =
+          PutRecordRequest.builder()
+              .streamName(stream)
+              .partitionKey(partitionKey)
+              .data(SdkBytes.fromByteArray(message.getPayload()))
+              .build();
+      executor.execute(
+          () -> {
+            try {
+              PutRecordResponse response = client.putRecord(request);
+              String id = response.shardId() + ":" + response.sequenceNumber();
+              cf.complete(
+                  PublishResult.forKinesis(
+                      stream, id, response.shardId(), response.sequenceNumber()));
+            } catch (RuntimeException e) {
+              cf.completeExceptionally(e);
+            }
+          });
+    } catch (RuntimeException e) {
+      cf.completeExceptionally(e);
+    }
     return cf;
   }
 
@@ -231,47 +242,64 @@ public class KinesisPublisher implements PubSubPublisher {
       cf.whenComplete((r, t) -> inflight.remove(cf));
     }
 
-    List<PutRecordsRequestEntry> entries = new ArrayList<>(n);
-    for (Message m : chunk) {
-      entries.add(
-          PutRecordsRequestEntry.builder()
-              .partitionKey(resolvePartitionKey(m))
-              .data(SdkBytes.fromByteArray(m.getPayload()))
-              .build());
+    PutRecordsRequest request;
+    try {
+      List<PutRecordsRequestEntry> entries = new ArrayList<>(n);
+      for (Message m : chunk) {
+        entries.add(
+            PutRecordsRequestEntry.builder()
+                .partitionKey(resolvePartitionKey(m))
+                .data(SdkBytes.fromByteArray(m.getPayload()))
+                .build());
+      }
+      request = PutRecordsRequest.builder().streamName(stream).records(entries).build();
+    } catch (RuntimeException e) {
+      // Same aggregation contract as doPublish: a sync request-build failure for this chunk
+      // becomes per-message failed futures so publishBatch can report it via PublishBatchException.
+      for (CompletableFuture<PublishResult> cf : futures) {
+        cf.completeExceptionally(e);
+      }
+      return futures;
     }
-    PutRecordsRequest request =
-        PutRecordsRequest.builder().streamName(stream).records(entries).build();
 
-    executor.execute(
-        () -> {
-          PutRecordsResponse response;
-          try {
-            response = client.putRecords(request);
-          } catch (RuntimeException e) {
-            for (CompletableFuture<PublishResult> cf : futures) {
-              cf.completeExceptionally(e);
+    try {
+      executor.execute(
+          () -> {
+            PutRecordsResponse response;
+            try {
+              response = client.putRecords(request);
+            } catch (RuntimeException e) {
+              for (CompletableFuture<PublishResult> cf : futures) {
+                cf.completeExceptionally(e);
+              }
+              return;
             }
-            return;
-          }
-          List<PutRecordsResultEntry> results = response.records();
-          for (int i = 0; i < futures.size(); i++) {
-            CompletableFuture<PublishResult> cf = futures.get(i);
-            PutRecordsResultEntry result = results.get(i);
-            if (result.errorCode() != null) {
-              cf.completeExceptionally(
-                  new RuntimeException(
-                      "Kinesis PutRecords entry failed: "
-                          + result.errorCode()
-                          + ": "
-                          + result.errorMessage()));
-            } else {
-              String id = result.shardId() + ":" + result.sequenceNumber();
-              cf.complete(
-                  PublishResult.forKinesis(
-                      stream, id, result.shardId(), result.sequenceNumber()));
+            List<PutRecordsResultEntry> results = response.records();
+            for (int i = 0; i < futures.size(); i++) {
+              CompletableFuture<PublishResult> cf = futures.get(i);
+              PutRecordsResultEntry result = results.get(i);
+              if (result.errorCode() != null) {
+                cf.completeExceptionally(
+                    new RuntimeException(
+                        "Kinesis PutRecords entry failed: "
+                            + result.errorCode()
+                            + ": "
+                            + result.errorMessage()));
+              } else {
+                String id = result.shardId() + ":" + result.sequenceNumber();
+                cf.complete(
+                    PublishResult.forKinesis(
+                        stream, id, result.shardId(), result.sequenceNumber()));
+              }
             }
-          }
-        });
+          });
+    } catch (RuntimeException e) {
+      // Synchronous executor.execute failure (RejectedExecutionException after shutdown, etc.):
+      // settle every future in this chunk so publishBatch reports the failure in aggregate.
+      for (CompletableFuture<PublishResult> cf : futures) {
+        cf.completeExceptionally(e);
+      }
+    }
     return futures;
   }
 

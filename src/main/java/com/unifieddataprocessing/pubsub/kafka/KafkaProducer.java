@@ -118,35 +118,42 @@ public class KafkaProducer implements PubSubPublisher {
   }
 
   private CompletableFuture<PublishResult> doPublish(Message message) {
-    Map<String, String> attrs = message.getAttributes();
-    String keyAttr = attrs.get(ATTR_KEY);
-    byte[] key = keyAttr == null ? null : keyAttr.getBytes(StandardCharsets.UTF_8);
-    RecordHeaders headers = new RecordHeaders();
-    for (Map.Entry<String, String> e : attrs.entrySet()) {
-      if (ATTR_KEY.equals(e.getKey())) {
-        continue;
-      }
-      headers.add(
-          new RecordHeader(
-              e.getKey(),
-              e.getValue() == null ? null : e.getValue().getBytes(StandardCharsets.UTF_8)));
-    }
-    ProducerRecord<byte[], byte[]> record =
-        new ProducerRecord<>(
-            message.getTopic(), null, null, key, message.getPayload(), headers);
     CompletableFuture<PublishResult> cf = new CompletableFuture<>();
-    String fallbackId = message.getId();
-    producer.send(
-        record,
-        (md, ex) -> {
-          if (ex != null) {
-            cf.completeExceptionally(ex);
-            return;
-          }
-          cf.complete(
-              PublishResult.forKafka(
-                  md.topic(), fallbackId, md.partition(), md.offset(), md.timestamp()));
-        });
+    // Funnel any synchronous failure (header/key encoding, producer.send throwing on a closed
+    // producer or metadata timeout, etc.) into the future so publishBatch's aggregate contract
+    // holds — siblings keep submitting and failures are reported via PublishBatchException.
+    try {
+      Map<String, String> attrs = message.getAttributes();
+      String keyAttr = attrs.get(ATTR_KEY);
+      byte[] key = keyAttr == null ? null : keyAttr.getBytes(StandardCharsets.UTF_8);
+      RecordHeaders headers = new RecordHeaders();
+      for (Map.Entry<String, String> e : attrs.entrySet()) {
+        if (ATTR_KEY.equals(e.getKey())) {
+          continue;
+        }
+        headers.add(
+            new RecordHeader(
+                e.getKey(),
+                e.getValue() == null ? null : e.getValue().getBytes(StandardCharsets.UTF_8)));
+      }
+      ProducerRecord<byte[], byte[]> record =
+          new ProducerRecord<>(
+              message.getTopic(), null, null, key, message.getPayload(), headers);
+      String fallbackId = message.getId();
+      producer.send(
+          record,
+          (md, ex) -> {
+            if (ex != null) {
+              cf.completeExceptionally(ex);
+              return;
+            }
+            cf.complete(
+                PublishResult.forKafka(
+                    md.topic(), fallbackId, md.partition(), md.offset(), md.timestamp()));
+          });
+    } catch (RuntimeException e) {
+      cf.completeExceptionally(e);
+    }
     return cf;
   }
 

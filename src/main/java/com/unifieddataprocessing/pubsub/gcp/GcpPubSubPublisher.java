@@ -151,35 +151,42 @@ public class GcpPubSubPublisher implements PubSubPublisher {
   }
 
   private CompletableFuture<PublishResult> doPublish(Message message) {
-    String topic = message.getTopic();
-    Publisher publisher = publishersByTopic.get(topic);
-    if (publisher == null) {
-      publisher = publisherFactory.apply(TopicName.of(config.getProjectId(), topic));
-      publishersByTopic.put(topic, publisher);
-    }
-    PubsubMessage pubsub =
-        PubsubMessage.newBuilder()
-            .setData(ByteString.copyFrom(message.getPayload()))
-            .putAllAttributes(message.getAttributes())
-            .build();
-    ApiFuture<String> apiFuture = publisher.publish(pubsub);
     CompletableFuture<PublishResult> cf = new CompletableFuture<>();
     inflight.add(cf);
     cf.whenComplete((r, t) -> inflight.remove(cf));
-    ApiFutures.addCallback(
-        apiFuture,
-        new ApiFutureCallback<String>() {
-          @Override
-          public void onSuccess(String messageId) {
-            cf.complete(PublishResult.forGcp(topic, messageId));
-          }
+    // Funnel any synchronous failure (publisher-build IOException-wrapped-as-UncheckedIOException,
+    // PubsubMessage build error, etc.) into the future so publishBatch's aggregate contract
+    // holds — siblings keep submitting and failures are reported via PublishBatchException.
+    try {
+      String topic = message.getTopic();
+      Publisher publisher = publishersByTopic.get(topic);
+      if (publisher == null) {
+        publisher = publisherFactory.apply(TopicName.of(config.getProjectId(), topic));
+        publishersByTopic.put(topic, publisher);
+      }
+      PubsubMessage pubsub =
+          PubsubMessage.newBuilder()
+              .setData(ByteString.copyFrom(message.getPayload()))
+              .putAllAttributes(message.getAttributes())
+              .build();
+      ApiFuture<String> apiFuture = publisher.publish(pubsub);
+      ApiFutures.addCallback(
+          apiFuture,
+          new ApiFutureCallback<String>() {
+            @Override
+            public void onSuccess(String messageId) {
+              cf.complete(PublishResult.forGcp(topic, messageId));
+            }
 
-          @Override
-          public void onFailure(Throwable t) {
-            cf.completeExceptionally(t);
-          }
-        },
-        MoreExecutors.directExecutor());
+            @Override
+            public void onFailure(Throwable t) {
+              cf.completeExceptionally(t);
+            }
+          },
+          MoreExecutors.directExecutor());
+    } catch (RuntimeException e) {
+      cf.completeExceptionally(e);
+    }
     return cf;
   }
 

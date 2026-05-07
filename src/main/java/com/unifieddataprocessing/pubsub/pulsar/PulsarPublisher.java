@@ -160,30 +160,46 @@ public class PulsarPublisher implements PubSubPublisher {
   }
 
   private CompletableFuture<PublishResult> doPublish(Message message) {
-    String topic = message.getTopic();
-    Producer<byte[]> producer = producersByTopic.get(topic);
-    if (producer == null) {
-      try {
-        producer = factory.newProducer(client, config, topic);
-      } catch (PulsarClientException e) {
-        CompletableFuture<PublishResult> failed = new CompletableFuture<>();
-        failed.completeExceptionally(new UncheckedIOException(e));
-        return failed;
+    CompletableFuture<PublishResult> cf = new CompletableFuture<>();
+    // Funnel any synchronous failure (producer-build PulsarClientException, builder construction,
+    // sendAsync throwing on a closed producer, etc.) into the future so publishBatch's aggregate
+    // contract holds — siblings keep submitting and the failure shows up in PublishBatchException.
+    try {
+      String topic = message.getTopic();
+      Producer<byte[]> producer = producersByTopic.get(topic);
+      if (producer == null) {
+        try {
+          producer = factory.newProducer(client, config, topic);
+        } catch (PulsarClientException e) {
+          cf.completeExceptionally(new UncheckedIOException(e));
+          return cf;
+        }
+        producersByTopic.put(topic, producer);
       }
-      producersByTopic.put(topic, producer);
+      Producer<byte[]> p = producer;
+      TypedMessageBuilder<byte[]> builder = producer.newMessage(Schema.BYTES);
+      builder.value(message.getPayload());
+      if (!message.getAttributes().isEmpty()) {
+        builder.properties(message.getAttributes());
+      }
+      builder
+          .sendAsync()
+          .whenComplete(
+              (mid, t) -> {
+                if (t != null) {
+                  cf.completeExceptionally(t);
+                  return;
+                }
+                cf.complete(
+                    PublishResult.forPulsar(
+                        topic,
+                        topic + "-" + mid.toString(),
+                        String.valueOf(p.getLastSequenceId())));
+              });
+    } catch (RuntimeException e) {
+      cf.completeExceptionally(e);
     }
-    Producer<byte[]> p = producer;
-    TypedMessageBuilder<byte[]> builder = producer.newMessage(Schema.BYTES);
-    builder.value(message.getPayload());
-    if (!message.getAttributes().isEmpty()) {
-      builder.properties(message.getAttributes());
-    }
-    return builder
-        .sendAsync()
-        .thenApply(
-            (MessageId mid) ->
-                PublishResult.forPulsar(
-                    topic, topic + "-" + mid.toString(), String.valueOf(p.getLastSequenceId())));
+    return cf;
   }
 
   private static CompletableFuture<List<PublishResult>> aggregate(

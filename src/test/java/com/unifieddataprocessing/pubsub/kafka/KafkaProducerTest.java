@@ -244,6 +244,44 @@ class KafkaProducerTest {
   }
 
   @Test
+  void publishBatch_synchronousSendFailureBecomesAggregatedFailure() {
+    publisher.connect();
+    KafkaException syncError = new KafkaException("sync");
+    AtomicReference<Integer> callIndex = new AtomicReference<>(0);
+    when(mockKafkaClient.send(any(ProducerRecord.class), any(Callback.class)))
+        .thenAnswer(
+            (Answer<java.util.concurrent.Future<RecordMetadata>>)
+                invocation -> {
+                  int idx = callIndex.get();
+                  callIndex.set(idx + 1);
+                  // Second send throws synchronously (e.g. metadata timeout / closed producer);
+                  // first and third must still go through and complete normally.
+                  if (idx == 1) {
+                    throw syncError;
+                  }
+                  Callback cb = invocation.getArgument(1);
+                  ProducerRecord<?, ?> rec = invocation.getArgument(0);
+                  cb.onCompletion(
+                      new RecordMetadata(new TopicPartition(rec.topic(), 0), 0L, 0, 0L, 0, 0),
+                      null);
+                  return null;
+                });
+
+    Message m1 = new Message("a", "topic-a", new byte[] {1}, null);
+    Message m2 = new Message("b", "topic-a", new byte[] {2}, null);
+    Message m3 = new Message("c", "topic-a", new byte[] {3}, null);
+
+    CompletableFuture<List<PublishResult>> batch = publisher.publishBatch(List.of(m1, m2, m3));
+    ExecutionException ee = assertThrows(ExecutionException.class, batch::get);
+    PublishBatchException pbe = (PublishBatchException) ee.getCause();
+    assertEquals(2, pbe.getSucceeded().size());
+    assertSame(syncError, pbe.getFailures().get(1));
+    // Sibling sends must still happen — the sync failure on index 1 must not abort the loop.
+    verify(mockKafkaClient, org.mockito.Mockito.times(3))
+        .send(any(ProducerRecord.class), any(Callback.class));
+  }
+
+  @Test
   void flush_callsProducerFlush() {
     publisher.connect();
     publisher.flush();
