@@ -282,6 +282,22 @@ class KafkaProducerTest {
   }
 
   @Test
+  void publishBatch_nullEntryRejectedBeforeAnySend() {
+    // A null entry partway through must throw before any record is submitted — otherwise a
+    // caller retrying the failed batch would duplicate the already-sent prefix.
+    publisher.connect();
+    Message m1 = new Message("a", "topic-a", new byte[] {1}, null);
+    Message m3 = new Message("c", "topic-a", new byte[] {3}, null);
+    List<Message> batch = new java.util.ArrayList<>();
+    batch.add(m1);
+    batch.add(null);
+    batch.add(m3);
+
+    assertThrows(NullPointerException.class, () -> publisher.publishBatch(batch));
+    verify(mockKafkaClient, never()).send(any(ProducerRecord.class), any(Callback.class));
+  }
+
+  @Test
   void flush_callsProducerFlush() {
     publisher.connect();
     publisher.flush();

@@ -91,9 +91,13 @@ public class KafkaProducer implements PubSubPublisher {
     if (messages.isEmpty()) {
       return CompletableFuture.completedFuture(Collections.emptyList());
     }
-    List<CompletableFuture<PublishResult>> perMessage = new ArrayList<>(messages.size());
+    // Validate every entry up front so a null partway through cannot leave the prefix submitted —
+    // a caller retrying the failed batch would otherwise duplicate the already-sent records.
     for (Message m : messages) {
       Objects.requireNonNull(m, "messages contains null");
+    }
+    List<CompletableFuture<PublishResult>> perMessage = new ArrayList<>(messages.size());
+    for (Message m : messages) {
       perMessage.add(doPublish(m));
     }
     return aggregate(perMessage);

@@ -125,7 +125,9 @@ public class KinesisPublisher implements PubSubPublisher {
 
     // Group inputs by stream while preserving the original index so we can reassemble per-message
     // futures in caller order. Each chunk goes out as a single PutRecords call (Kinesis caps at
-    // 500 records per call).
+    // 500 records per call). Note: this loop also validates every entry up front (a null partway
+    // through throws here before any submission), so a caller retrying the failed batch cannot
+    // duplicate a prefix of records that were already sent.
     Map<String, List<Integer>> indicesByStream = new LinkedHashMap<>();
     for (int i = 0; i < messages.size(); i++) {
       Message m = messages.get(i);
