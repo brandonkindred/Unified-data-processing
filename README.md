@@ -203,9 +203,9 @@ import com.unifieddataprocessing.pubsub.PubSubPublisher;
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducer;
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
 
-KafkaProducerConfig cfg = KafkaProducerConfig.builder()
-    .bootstrapServers("broker-1:9092,broker-2:9092")
-    .build();
+KafkaProducerConfig cfg = new KafkaProducerConfig("broker-1:9092,broker-2:9092");
+// Or with extra Kafka client props:
+// new KafkaProducerConfig("broker-1:9092", Map.of(ProducerConfig.ACKS_CONFIG, "all"));
 
 try (PubSubPublisher pub = new KafkaProducer(cfg)) {
   pub.connect();
@@ -228,8 +228,9 @@ attributes are emitted as record headers.
 ```java
 import com.unifieddataprocessing.pubsub.msk.MskPublisherConfig;
 
-KafkaProducerConfig cfg = MskPublisherConfig.iam("b-1.cluster.kafka.amazonaws.com:9098");
-// or: MskPublisherConfig.scramSha512(bootstrap, username, password);
+KafkaProducerConfig cfg = MskPublisherConfig.iamAuth(
+    "b-1.cluster.kafka.amazonaws.com:9098", "us-east-1");
+// or: MskPublisherConfig.saslScram(bootstrap, username, password);
 PubSubPublisher pub = new KafkaProducer(cfg);
 ```
 
@@ -241,10 +242,7 @@ import com.unifieddataprocessing.pubsub.kafka.KafkaConsumer;
 import com.unifieddataprocessing.pubsub.kafka.KafkaConsumerConfig;
 import java.time.Duration;
 
-KafkaConsumerConfig cfg = KafkaConsumerConfig.builder()
-    .bootstrapServers("broker-1:9092")
-    .groupId("my-app")
-    .build();
+KafkaConsumerConfig cfg = new KafkaConsumerConfig("broker-1:9092", "my-app");
 
 try (PubSubConsumer consumer = new KafkaConsumer(cfg)) {
   consumer.connect();
@@ -298,8 +296,8 @@ try {
   List<PublishResult> ok = f.join();
 } catch (CompletionException ce) {
   if (ce.getCause() instanceof PublishBatchException pbe) {
-    List<PublishResult> partial = pbe.succeeded();
-    Map<Integer, Throwable> failed = pbe.failures();
+    List<PublishResult> partial = pbe.getSucceeded();
+    Map<Integer, Throwable> failed = pbe.getFailures();
     // ... handle partial success
   }
 }
@@ -329,9 +327,7 @@ import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
 import java.time.Duration;
 
 DataBridgeConfig cfg = DataBridgeConfig.builder()
-    .producerConfig(KafkaProducerConfig.builder()
-        .bootstrapServers("broker-1:9092")
-        .build())
+    .producerConfig(new KafkaProducerConfig("broker-1:9092"))
     .defaultPartitions(6)
     .defaultReplicationFactor((short) 3)
     .pollTimeout(Duration.ofSeconds(1))
