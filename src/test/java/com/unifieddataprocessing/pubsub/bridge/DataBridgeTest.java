@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -18,8 +19,10 @@ import static org.mockito.Mockito.when;
 import com.unifieddataprocessing.pubsub.Message;
 import com.unifieddataprocessing.pubsub.PubSubConsumer;
 import com.unifieddataprocessing.pubsub.PubSubPublisher;
+import com.unifieddataprocessing.pubsub.PublishResult;
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,6 +34,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -83,6 +87,20 @@ class DataBridgeTest {
   private DataBridge newBridge() {
     return new DataBridge(
         config, publisherFactory, adminFactory, singleThreadFactory, noopSleeper);
+  }
+
+  private DataBridge newBridge(Sleeper sleeper) {
+    return new DataBridge(config, publisherFactory, adminFactory, singleThreadFactory, sleeper);
+  }
+
+  /** Records every {@link Sleeper#sleep(Duration)} invocation; thread-safe for worker threads. */
+  static final class CountingSleeper implements Sleeper {
+    final List<Duration> sleeps = Collections.synchronizedList(new ArrayList<>());
+
+    @Override
+    public void sleep(Duration d) {
+      sleeps.add(d);
+    }
   }
 
   /** Stubs the Kafka admin + publisher mocks for tests that exercise the happy path. */
@@ -212,6 +230,179 @@ class DataBridgeTest {
     Set<String> publishedTopics =
         captor.getAllValues().stream().map(Message::getTopic).collect(Collectors.toSet());
     assertEquals(Set.of("src.chanA", "src.chanB"), publishedTopics);
+  }
+
+  @Test
+  void pollThrowsThenRecovers() throws Exception {
+    stubKafkaHappyPath("src.chan");
+    Message source = msg("m-1", "topic-a", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenThrow(new RuntimeException("transient poll error"))
+        .thenReturn(List.of(source))
+        .thenReturn(List.of());
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "consumerA should ack after poll recovers");
+    bridge.close();
+
+    verify(mockPublisher, times(1)).publish(any(Message.class));
+    verify(consumerA, times(1)).acknowledge(any(Message.class));
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void publishTimesOut_skipsAck_breaksBatch() throws Exception {
+    // Shorten publishTimeout so the timed-out get() returns quickly.
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(50))
+            .publishTimeout(Duration.ofMillis(100))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chan");
+
+    Message m1 = msg("m-1", "topic-a", Map.of());
+    Message m2 = msg("m-2", "topic-a", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1, m2))
+        .thenReturn(List.of(m1, m2))
+        .thenReturn(List.of());
+
+    // First publish never completes (triggers TimeoutException); subsequent calls succeed.
+    CompletableFuture<PublishResult> neverCompletes = new CompletableFuture<>();
+    when(mockPublisher.publish(any(Message.class)))
+        .thenReturn(neverCompletes)
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(2);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    DataBridge bridge = newBridge();
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+    assertTrue(ackLatch.await(3, TimeUnit.SECONDS), "both messages should ack after redelivery");
+    bridge.close();
+
+    // Batch 1: publish(m1) times out, break batch, neither m1 nor m2 acked, m2 not published.
+    // Batch 2: publish(m1) + publish(m2) both succeed, both acked.
+    verify(mockPublisher, times(3)).publish(any(Message.class));
+    verify(consumerA, times(2)).acknowledge(any(Message.class));
+  }
+
+  @Test
+  void publishFails_skipsAck_breaksBatch() throws Exception {
+    stubKafkaHappyPath("src.chan");
+
+    Message m1 = msg("m-1", "topic-a", Map.of());
+    Message m2 = msg("m-2", "topic-a", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1, m2))
+        .thenReturn(List.of(m1, m2))
+        .thenReturn(List.of());
+
+    CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+    failed.completeExceptionally(new RuntimeException("publish-fail"));
+    when(mockPublisher.publish(any(Message.class)))
+        .thenReturn(failed)
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(2);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    DataBridge bridge = newBridge();
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+    assertTrue(ackLatch.await(3, TimeUnit.SECONDS), "both messages should ack after redelivery");
+    bridge.close();
+
+    verify(mockPublisher, times(3)).publish(any(Message.class));
+    verify(consumerA, times(2)).acknowledge(any(Message.class));
+  }
+
+  @Test
+  void failingSourceDoesNotBlockHealthySource() throws Exception {
+    stubKafkaHappyPath("src.chanA", "src.chanB");
+
+    AtomicInteger counter = new AtomicInteger();
+    when(consumerA.poll(any(Duration.class)))
+        .thenAnswer(
+            inv -> List.of(msg("a-" + counter.incrementAndGet(), "topic-a", Map.of())));
+    when(consumerB.poll(any(Duration.class)))
+        .thenAnswer(
+            inv -> {
+              throw new RuntimeException("source-b broken");
+            });
+
+    CountDownLatch ackLatch = new CountDownLatch(3);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    // Real two-thread pool so the failing source can't starve the healthy one.
+    singleThreadFactory = n -> Executors.newFixedThreadPool(n);
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chanA", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.register("src", "chanB", "topic-b", consumerB, ChannelOptions.defaults());
+    bridge.start();
+    assertTrue(ackLatch.await(5, TimeUnit.SECONDS), "source A should ack >= 3 times");
+    // Wait for source B to have run its catch+backoff at least once — under tight scheduling A
+    // can finish 3 acks before B's worker is even scheduled.
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+    while (sleeper.sleeps.isEmpty() && System.nanoTime() < deadline) {
+      Thread.sleep(10);
+    }
+
+    long t0 = System.nanoTime();
+    bridge.close();
+    long elapsedNs = System.nanoTime() - t0;
+
+    verify(consumerA, atLeast(3)).acknowledge(any(Message.class));
+    assertTrue(
+        sleeper.sleeps.size() >= 1,
+        "source B's poll failures should have triggered at least one backoff sleep");
+
+    // shutdownTimeout + closeForceTimeout is the hard upper bound for executor termination;
+    // add a small scheduling grace for JVM cold-start so the test is stable on slow CI runners.
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofMillis(500));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() took " + Duration.ofNanos(elapsedNs) + " but budget is " + budget);
   }
 
   @Test
