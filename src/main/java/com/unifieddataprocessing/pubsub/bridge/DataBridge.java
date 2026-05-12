@@ -57,13 +57,17 @@ public final class DataBridge implements AutoCloseable {
   private PubSubPublisher publisher;
   private ExecutorService executor;
 
-  /** Production constructor: uses real Kafka clients and a fixed-thread executor. */
+  /**
+   * Production constructor. The executor is single-threaded in this chunk so the shared {@link
+   * PubSubPublisher} (documented as not thread-safe) is only ever touched by one poll loop at a
+   * time. Multi-source threading lands in a follow-up chunk along with its concurrency contract.
+   */
   public DataBridge(DataBridgeConfig config) {
     this(
         config,
         KafkaProducer::new,
         AdminClient::create,
-        Executors::newFixedThreadPool,
+        n -> Executors.newSingleThreadExecutor(),
         Sleeper.real());
   }
 
