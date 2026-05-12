@@ -49,4 +49,14 @@
     <Method name="getTopicConfigs"/>
     <Bug pattern="EI_EXPOSE_REP"/>
   </Match>
+
+  <!--
+    DataBridge.sleeper is wired into the test ctor for #19 but only read once
+    poll-failure backoff lands in chunk #21. Remove this entry then.
+  -->
+  <Match>
+    <Class name="com.unifieddataprocessing.pubsub.bridge.DataBridge"/>
+    <Field name="sleeper"/>
+    <Bug pattern="URF_UNREAD_FIELD"/>
+  </Match>
 </FindBugsFilter>
