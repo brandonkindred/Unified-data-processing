@@ -372,17 +372,22 @@ try (DataBridge bridge = new DataBridge(cfg)) {
 mvn clean verify
 ```
 
-The build runs Checkstyle (`google_checks.xml`, warning-severity) and
-SpotBugs (Max effort, Medium threshold, excludes in `spotbugs-exclude.xml`) and
-fails on any violation. Unit tests run via Surefire (JUnit 5 + Mockito).
+This compiles, runs the unit tests via Surefire (JUnit 5 + Mockito), and
+packages the JAR. Checkstyle (`google_checks.xml`, warning-severity) and
+SpotBugs (Max effort, Medium threshold, excludes in `spotbugs-exclude.xml`)
+are configured but **not bound to a lifecycle phase**, so `mvn verify`
+does not run them — invoke their goals explicitly, matching CI:
+
+```bash
+mvn checkstyle:check          # lint
+mvn compile spotbugs:check    # static analysis (needs compiled classes)
+```
 
 Quick iteration:
 
 ```bash
 mvn -DskipTests package       # build a JAR
 mvn test                      # tests only
-mvn checkstyle:check          # lint only
-mvn spotbugs:check            # static analysis only
 ```
 
 ## Testing
