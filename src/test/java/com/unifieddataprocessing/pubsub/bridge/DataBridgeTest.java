@@ -23,6 +23,7 @@ import com.unifieddataprocessing.pubsub.PublishResult;
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -39,6 +40,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.CreateTopicsResult;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.errors.TopicAuthorizationException;
 import org.apache.kafka.common.internals.KafkaFutureImpl;
@@ -588,5 +590,80 @@ class DataBridgeTest {
 
     verify(mockPublisher, times(1)).close();
     verify(consumerA, times(1)).close();
+  }
+
+  @Test
+  void perChannelOptionsHonored() {
+    stubKafkaHappyPath("srcA.chA", "srcB.chB");
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+    lenient().when(consumerB.poll(any(Duration.class))).thenReturn(List.of());
+
+    DataBridge bridge = newBridge();
+    bridge.register("srcA", "chA", "src-topic-a", consumerA, ChannelOptions.defaults());
+    bridge.register(
+        "srcB",
+        "chB",
+        "src-topic-b",
+        consumerB,
+        ChannelOptions.builder()
+            .partitions(6)
+            .replicationFactor((short) 3)
+            .topicConfig("retention.ms", "604800000")
+            .build());
+    bridge.start();
+    bridge.close();
+
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<Collection<NewTopic>> captor = ArgumentCaptor.forClass(Collection.class);
+    verify(mockAdminClient).createTopics(captor.capture());
+    Map<String, NewTopic> byName =
+        captor.getValue().stream().collect(Collectors.toMap(NewTopic::name, t -> t));
+
+    NewTopic ntA = byName.get("srcA.chA");
+    assertEquals(1, ntA.numPartitions());
+    assertEquals((short) 1, ntA.replicationFactor());
+    assertTrue(
+        ntA.configs() == null || ntA.configs().isEmpty(),
+        "defaults() should pass through an empty topicConfigs map");
+
+    NewTopic ntB = byName.get("srcB.chB");
+    assertEquals(6, ntB.numPartitions());
+    assertEquals((short) 3, ntB.replicationFactor());
+    assertEquals(Map.of("retention.ms", "604800000"), ntB.configs());
+  }
+
+  @Test
+  void partialOverride_fallsBackToDefaultsForUnsetField() {
+    // Use a non-default replicationFactor so the fallback path is observable.
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(50))
+            .publishTimeout(Duration.ofMillis(500))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 2)
+            .build();
+    stubKafkaHappyPath("src.chan");
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+
+    DataBridge bridge = newBridge();
+    bridge.register(
+        "src", "chan", "src-topic", consumerA, ChannelOptions.builder().partitions(8).build());
+    bridge.start();
+    bridge.close();
+
+    @SuppressWarnings("unchecked")
+    ArgumentCaptor<Collection<NewTopic>> captor = ArgumentCaptor.forClass(Collection.class);
+    verify(mockAdminClient).createTopics(captor.capture());
+    NewTopic nt = captor.getValue().iterator().next();
+    assertEquals("src.chan", nt.name());
+    assertEquals(8, nt.numPartitions());
+    assertEquals((short) 2, nt.replicationFactor());
+    assertTrue(
+        nt.configs() == null || nt.configs().isEmpty(),
+        "unset topicConfigs should remain empty");
   }
 }

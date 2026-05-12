@@ -40,7 +40,9 @@ import org.apache.kafka.clients.admin.AdminClient;
  * N worker threads and relies on the underlying Kafka client being thread-safe for {@code send}.
  * A failing {@code poll(...)} backs off via the injected {@link Sleeper} and retries; a failing
  * {@code publish(...)} (timeout or execution failure) breaks the current batch without acking, so
- * the source will redeliver. Per-channel topic overrides are layered on by a future chunk.
+ * the source will redeliver. Per-channel {@link ChannelOptions} layered over the
+ * {@link DataBridgeConfig} defaults control each topic's partitions, replication factor, and Kafka
+ * topic-configs at provision time.
  */
 public final class DataBridge implements AutoCloseable {
 
@@ -145,12 +147,16 @@ public final class DataBridge implements AutoCloseable {
     try {
       List<NewTopicSpec> specs = new ArrayList<>(registrations.size());
       for (Registration reg : registrations) {
+        ChannelOptions options = reg.options();
+        int partitions =
+            options.getPartitions() == 0 ? config.defaultPartitions() : options.getPartitions();
+        short replicationFactor =
+            options.getReplicationFactor() == 0
+                ? config.defaultReplicationFactor()
+                : options.getReplicationFactor();
         specs.add(
             new NewTopicSpec(
-                reg.targetTopic(),
-                config.defaultPartitions(),
-                config.defaultReplicationFactor(),
-                Collections.emptyMap()));
+                reg.targetTopic(), partitions, replicationFactor, options.getTopicConfigs()));
       }
       provisioner.provision(config.producerConfig().toProperties(), specs);
 
