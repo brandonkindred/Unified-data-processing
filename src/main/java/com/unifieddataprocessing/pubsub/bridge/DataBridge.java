@@ -13,10 +13,14 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.apache.kafka.clients.admin.AdminClient;
 
 /**
@@ -34,9 +38,13 @@ import org.apache.kafka.clients.admin.AdminClient;
  * {@code flush}, {@code close}) is single-threaded on the caller's thread, bounded by
  * {@code shutdownTimeout + closeForceTimeout}; {@code publish(...)} is invoked concurrently from
  * N worker threads and relies on the underlying Kafka client being thread-safe for {@code send}.
- * Per-channel topic overrides and poll/publish resilience are layered on by additional chunks.
+ * A failing {@code poll(...)} backs off via the injected {@link Sleeper} and retries; a failing
+ * {@code publish(...)} (timeout or execution failure) breaks the current batch without acking, so
+ * the source will redeliver. Per-channel topic overrides are layered on by a future chunk.
  */
 public final class DataBridge implements AutoCloseable {
+
+  private static final Logger LOG = Logger.getLogger(DataBridge.class.getName());
 
   private enum State {
     Configured,
@@ -244,32 +252,47 @@ public final class DataBridge implements AutoCloseable {
   }
 
   private void pollLoopForever(Registration reg, PubSubPublisher pub) {
-    try {
-      while (state == State.Running) {
-        pollLoopOnce(reg, pub);
+    while (state == State.Running) {
+      List<Message> batch;
+      try {
+        batch = reg.consumer().poll(config.pollTimeout());
+      } catch (RuntimeException e) {
+        LOG.log(Level.WARNING, "poll failed for " + reg.targetTopic() + "; backing off", e);
+        try {
+          sleeper.sleep(config.pollBackoff());
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          return;
+        }
+        continue;
       }
-    } catch (Throwable t) {
-      // Resilient handling (poll backoff, publish-failure break-batch) lands in #21. For now any
-      // uncaught throwable exits this source's worker; sibling workers are unaffected because
-      // each runs on its own pool thread.
+      if (!processBatch(reg, pub, batch)) {
+        return;
+      }
     }
   }
 
-  private void pollLoopOnce(Registration reg, PubSubPublisher pub) throws Exception {
-    List<Message> batch = reg.consumer().poll(config.pollTimeout());
+  private boolean processBatch(Registration reg, PubSubPublisher pub, List<Message> batch) {
     for (Message m : batch) {
       if (state != State.Running) {
-        break;
+        return true;
       }
       Message rewritten = MessageRewriter.rewrite(m, reg);
       try {
         pub.publish(rewritten).get(config.publishTimeout().toMillis(), TimeUnit.MILLISECONDS);
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
-        return;
+        return false;
+      } catch (ExecutionException | TimeoutException e) {
+        LOG.log(
+            Level.WARNING,
+            "publish failed for " + reg.targetTopic() + "; breaking batch (no ack)",
+            e);
+        return true;
       }
       reg.consumer().acknowledge(m);
     }
+    return true;
   }
 
   private static boolean awaitQuietly(ExecutorService exec, long millis) {
