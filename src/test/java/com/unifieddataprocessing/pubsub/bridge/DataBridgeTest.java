@@ -25,12 +25,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.CreateTopicsResult;
 import org.apache.kafka.common.KafkaFuture;
@@ -168,6 +170,48 @@ class DataBridgeTest {
     assertEquals("chan", published.getAttributes().get(BridgeAttributes.BRIDGE_CHANNEL));
     assertEquals("k-1", published.getAttributes().get("kafkaKey"));
     assertEquals("m-1", published.getId());
+  }
+
+  @Test
+  void twoSources_eachPublishedAndAcked() throws Exception {
+    stubKafkaHappyPath("src.chanA", "src.chanB");
+
+    Message messageA = msg("m-A", "topic-a", Map.of());
+    Message messageB = msg("m-B", "topic-b", Map.of());
+    when(consumerA.poll(any(Duration.class))).thenReturn(List.of(messageA)).thenReturn(List.of());
+    when(consumerB.poll(any(Duration.class))).thenReturn(List.of(messageB)).thenReturn(List.of());
+
+    CountDownLatch ackLatch = new CountDownLatch(2);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerB)
+        .acknowledge(any(Message.class));
+
+    // Override the test default (single-thread) so two poll loops can run concurrently.
+    singleThreadFactory = n -> Executors.newFixedThreadPool(n);
+
+    DataBridge bridge = newBridge();
+    bridge.register("src", "chanA", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.register("src", "chanB", "topic-b", consumerB, ChannelOptions.defaults());
+    bridge.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "both consumers should have acked");
+    bridge.close();
+
+    ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
+    verify(mockPublisher, times(2)).publish(captor.capture());
+    Set<String> publishedTopics =
+        captor.getAllValues().stream().map(Message::getTopic).collect(Collectors.toSet());
+    assertEquals(Set.of("src.chanA", "src.chanB"), publishedTopics);
   }
 
   @Test

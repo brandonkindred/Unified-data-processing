@@ -29,11 +29,12 @@ import org.apache.kafka.clients.admin.AdminClient;
  * at-least-once: a source message is acked only after the corresponding Kafka publish completes
  * within {@code publishTimeout}.
  *
- * <p>This chunk introduces the skeleton: register, start, a single-threaded poll path that
- * round-robins over every registration, and a synchronized two-stage shutdown. A future chunk
- * promotes the worker to one task per registration on a fixed thread pool together with the
- * publisher's concurrency contract; per-channel topic overrides and poll/publish resilience are
- * layered on by additional chunks.
+ * <p>Each registration runs on its own worker thread, drawn from a fixed-size pool sized to the
+ * number of registrations. The {@link PubSubPublisher} wrapper's lifecycle ({@code connect},
+ * {@code flush}, {@code close}) is single-threaded on the caller's thread, bounded by
+ * {@code shutdownTimeout + closeForceTimeout}; {@code publish(...)} is invoked concurrently from
+ * N worker threads and relies on the underlying Kafka client being thread-safe for {@code send}.
+ * Per-channel topic overrides and poll/publish resilience are layered on by additional chunks.
  */
 public final class DataBridge implements AutoCloseable {
 
@@ -60,16 +61,15 @@ public final class DataBridge implements AutoCloseable {
   private ExecutorService executor;
 
   /**
-   * Production constructor. The executor is single-threaded in this chunk so the shared {@link
-   * PubSubPublisher} (documented as not thread-safe) is only ever touched by one poll loop at a
-   * time. Multi-source threading lands in a follow-up chunk along with its concurrency contract.
+   * Production constructor. The default executor is {@link Executors#newFixedThreadPool(int)}
+   * sized to the number of registrations, so each source polls on its own worker thread.
    */
   public DataBridge(DataBridgeConfig config) {
     this(
         config,
         KafkaProducer::new,
         AdminClient::create,
-        n -> Executors.newSingleThreadExecutor(),
+        n -> Executors.newFixedThreadPool(n),
         Sleeper.real());
   }
 
@@ -162,8 +162,14 @@ public final class DataBridge implements AutoCloseable {
       state = State.Running;
 
       PubSubPublisher pub = publisher;
-      List<Registration> regs = List.copyOf(registrations);
-      executor.submit(() -> pollLoopForever(regs, pub));
+      for (Registration reg : registrations) {
+        executor.submit(
+            () -> {
+              Thread.currentThread()
+                  .setName("data-bridge-" + reg.sourceId() + "-" + reg.channel());
+              pollLoopForever(reg, pub);
+            });
+      }
     } catch (RuntimeException | Error e) {
       cleanupAfterFailedStart(allocatedExecutor, connectedSoFar, publisherConnected);
       throw e;
@@ -237,20 +243,15 @@ public final class DataBridge implements AutoCloseable {
     state = State.Closed;
   }
 
-  private void pollLoopForever(List<Registration> regs, PubSubPublisher pub) {
+  private void pollLoopForever(Registration reg, PubSubPublisher pub) {
     try {
       while (state == State.Running) {
-        for (Registration reg : regs) {
-          if (state != State.Running) {
-            break;
-          }
-          pollLoopOnce(reg, pub);
-        }
+        pollLoopOnce(reg, pub);
       }
     } catch (Throwable t) {
-      // Resilient handling (poll backoff, publish-failure break-batch) lands in a later chunk.
-      // For now any uncaught throwable exits the worker, preserving failure isolation across
-      // bridge instances (multi-source failure isolation arrives with the multi-thread chunk).
+      // Resilient handling (poll backoff, publish-failure break-batch) lands in #21. For now any
+      // uncaught throwable exits this source's worker; sibling workers are unaffected because
+      // each runs on its own pool thread.
     }
   }
 
