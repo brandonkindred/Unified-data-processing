@@ -44,4 +44,9 @@
     <Method name="getSucceeded"/>
     <Bug pattern="EI_EXPOSE_REP"/>
   </Match>
+  <Match>
+    <Class name="com.unifieddataprocessing.pubsub.bridge.ChannelOptions"/>
+    <Method name="getTopicConfigs"/>
+    <Bug pattern="EI_EXPOSE_REP"/>
+  </Match>
 </FindBugsFilter>
