@@ -24,14 +24,16 @@ import org.apache.kafka.clients.admin.AdminClient;
  *
  * <p>Callers register existing source consumers under a {@code (sourceId, channel, sourceTopic)}
  * triple; the bridge owns each registered consumer's {@code connect/subscribe/close} lifecycle,
- * polls each on a dedicated executor thread, republishes every message to a Kafka topic named
+ * polls each from the bridge's executor, republishes every message to a Kafka topic named
  * {@code sourceId + "." + channel}, and auto-provisions the topic on first run. Delivery is
  * at-least-once: a source message is acked only after the corresponding Kafka publish completes
  * within {@code publishTimeout}.
  *
- * <p>This chunk introduces the skeleton: register, start, a single-threaded poll path, and a
- * synchronized two-stage shutdown. Per-channel topic overrides, multi-source threading, and
- * resilience around poll/publish failures are layered on by later chunks.
+ * <p>This chunk introduces the skeleton: register, start, a single-threaded poll path that
+ * round-robins over every registration, and a synchronized two-stage shutdown. A future chunk
+ * promotes the worker to one task per registration on a fixed thread pool together with the
+ * publisher's concurrency contract; per-channel topic overrides and poll/publish resilience are
+ * layered on by additional chunks.
  */
 public final class DataBridge implements AutoCloseable {
 
@@ -160,9 +162,8 @@ public final class DataBridge implements AutoCloseable {
       state = State.Running;
 
       PubSubPublisher pub = publisher;
-      for (Registration reg : registrations) {
-        executor.submit(() -> pollLoopForever(reg, pub));
-      }
+      List<Registration> regs = List.copyOf(registrations);
+      executor.submit(() -> pollLoopForever(regs, pub));
     } catch (RuntimeException | Error e) {
       cleanupAfterFailedStart(allocatedExecutor, connectedSoFar, publisherConnected);
       throw e;
@@ -236,14 +237,20 @@ public final class DataBridge implements AutoCloseable {
     state = State.Closed;
   }
 
-  private void pollLoopForever(Registration reg, PubSubPublisher pub) {
+  private void pollLoopForever(List<Registration> regs, PubSubPublisher pub) {
     try {
       while (state == State.Running) {
-        pollLoopOnce(reg, pub);
+        for (Registration reg : regs) {
+          if (state != State.Running) {
+            break;
+          }
+          pollLoopOnce(reg, pub);
+        }
       }
     } catch (Throwable t) {
       // Resilient handling (poll backoff, publish-failure break-batch) lands in a later chunk.
-      // For now any uncaught throwable exits THIS loop only, preserving failure isolation.
+      // For now any uncaught throwable exits the worker, preserving failure isolation across
+      // bridge instances (multi-source failure isolation arrives with the multi-thread chunk).
     }
   }
 
