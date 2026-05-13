@@ -246,7 +246,7 @@ class DataRelayTest {
   }
 
   @Test
-  void publishTimesOut_skipsAck_breaksBatch() throws Exception {
+  void publishTimesOut_pausesAndRetriesSameMessage_noFurtherPoll() throws Exception {
     // Shorten publishTimeout so the timed-out get() returns quickly.
     config =
         DataRelayConfig.builder()
@@ -261,10 +261,10 @@ class DataRelayTest {
     Message m2 = msg("m-2", "shopify.orders", Map.of());
     when(consumerA.poll(any(Duration.class)))
         .thenReturn(List.of(m1, m2))
-        .thenReturn(List.of(m1, m2))
         .thenReturn(List.of());
 
-    // First publish never completes (triggers TimeoutException); subsequent calls succeed.
+    // First publish never completes (TimeoutException); subsequent calls succeed.
+    // The relay should retry the SAME message (m1) without polling again, then publish m2.
     CompletableFuture<PublishResult> neverCompletes = new CompletableFuture<>();
     when(publisherA.publish(any(Message.class)))
         .thenReturn(neverCompletes)
@@ -279,24 +279,25 @@ class DataRelayTest {
         .when(consumerA)
         .acknowledge(any(Message.class));
 
-    DataRelay relay = newRelay();
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
     relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
     relay.start();
-    assertTrue(ackLatch.await(3, TimeUnit.SECONDS), "both messages should ack after redelivery");
+    assertTrue(ackLatch.await(3, TimeUnit.SECONDS), "both messages should ack after retry");
     relay.close();
 
-    // Batch 1: publish(m1) times out, break batch, neither m1 nor m2 acked, m2 not published.
-    // Batch 2: publish(m1) + publish(m2) both succeed, both acked.
+    // 3 publishes: m1 timeout + m1 retry-success + m2 success. 2 acks.
     verify(publisherA, times(3)).publish(any(Message.class));
     verify(consumerA, times(2)).acknowledge(any(Message.class));
+    // Exactly one backoff sleep, for the single publish failure.
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
   }
 
   @Test
-  void publishFails_skipsAck_breaksBatch() throws Exception {
+  void publishFails_pausesAndRetriesSameMessage_noFurtherPoll() throws Exception {
     Message m1 = msg("m-1", "shopify.orders", Map.of());
     Message m2 = msg("m-2", "shopify.orders", Map.of());
     when(consumerA.poll(any(Duration.class)))
-        .thenReturn(List.of(m1, m2))
         .thenReturn(List.of(m1, m2))
         .thenReturn(List.of());
 
@@ -315,14 +316,16 @@ class DataRelayTest {
         .when(consumerA)
         .acknowledge(any(Message.class));
 
-    DataRelay relay = newRelay();
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
     relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
     relay.start();
-    assertTrue(ackLatch.await(3, TimeUnit.SECONDS), "both messages should ack after redelivery");
+    assertTrue(ackLatch.await(3, TimeUnit.SECONDS), "both messages should ack after retry");
     relay.close();
 
     verify(publisherA, times(3)).publish(any(Message.class));
     verify(consumerA, times(2)).acknowledge(any(Message.class));
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
   }
 
   @Test

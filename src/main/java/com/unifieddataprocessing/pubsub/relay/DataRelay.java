@@ -35,8 +35,9 @@ import java.util.logging.Logger;
  *
  * <p>Each registration runs on its own worker thread, drawn from a fixed-size pool sized to the
  * number of registrations. Per-registration publishers and consumers are isolated: a failing
- * downstream destination breaks only its own batch (without acking, so the backbone redelivers)
- * and does not block other registrations.
+ * downstream destination pauses only its own poll loop (retrying the in-flight message with
+ * {@code pollBackoff} until it succeeds or {@code close()} is called) and does not block other
+ * registrations.
  */
 public final class DataRelay implements AutoCloseable {
 
@@ -265,10 +266,36 @@ public final class DataRelay implements AutoCloseable {
         return true;
       }
       Message rewritten = RelayMessageRewriter.rewrite(m, reg);
+      if (!publishWithRetry(reg, rewritten)) {
+        return false;
+      }
+      if (state != State.Running) {
+        return true;
+      }
+      reg.consumer().acknowledge(m);
+    }
+    return true;
+  }
+
+  /**
+   * Publishes a single message, retrying on timeout/failure with {@code pollBackoff} until success
+   * or {@code close()}. Returning {@code false} indicates the worker was interrupted and the poll
+   * loop should exit.
+   *
+   * <p>Retrying the same message in-place (rather than breaking the batch and letting the poll
+   * loop continue) keeps the source consumer's delivered/acked cursor contiguous: a
+   * {@link com.unifieddataprocessing.pubsub.PubSubConsumer} that tracks delivered offsets
+   * internally (e.g. the project's Kafka consumer wrapper) would otherwise advance past the failed
+   * message on the next {@code poll()}, stranding it until rebalance/restart and turning every
+   * later record into a duplicate after recovery.
+   */
+  private boolean publishWithRetry(RelayRegistration reg, Message rewritten) {
+    while (state == State.Running) {
       try {
         reg.publisher()
             .publish(rewritten)
             .get(config.publishTimeout().toMillis(), TimeUnit.MILLISECONDS);
+        return true;
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
         return false;
@@ -279,11 +306,15 @@ public final class DataRelay implements AutoCloseable {
                 + reg.destinationId()
                 + "/"
                 + reg.downstreamTopic()
-                + "; breaking batch (no ack)",
+                + "; pausing and retrying the same message",
             e);
-        return true;
+        try {
+          sleeper.sleep(config.pollBackoff());
+        } catch (InterruptedException sleepInterrupt) {
+          Thread.currentThread().interrupt();
+          return false;
+        }
       }
-      reg.consumer().acknowledge(m);
     }
     return true;
   }
