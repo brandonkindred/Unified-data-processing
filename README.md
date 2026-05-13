@@ -117,35 +117,25 @@ single-message, sync, and batch APIs.
 
 ## Architecture
 
-```
-+---------------------+   +-----------------------+   +-----------------+
-|  KafkaConsumer      |   |  PulsarConsumer       |   |  GcpPubSub      |
-|  KinesisConsumer    |   |  (any PubSubConsumer) |   |  Consumer       |
-+----------+----------+   +-----------+-----------+   +--------+--------+
-           \                          |                        /
-            \                         |                       /
-             v                        v                      v
-                 +-----------------------------------+
-                 |             DataBridge            |
-                 |  - owns connect/subscribe/close   |
-                 |  - polls each registration        |
-                 |  - rewrites attributes (provenance|
-                 |    BRIDGE_SOURCE_ID / _TOPIC /    |
-                 |    _CHANNEL)                      |
-                 |  - publishes to Kafka and only    |
-                 |    then acks the source           |
-                 +-----------------+-----------------+
-                                   |
-                                   v
-                       +-----------------------+
-                       | Kafka backbone topic  |
-                       | "sourceId.channel"    |
-                       | auto-provisioned via  |
-                       | BridgeTopicProvisioner|
-                       +-----------------------+
-                                   |
-                                   v
-                  downstream analytics / AI consumers
+```mermaid
+flowchart TD
+    subgraph Sources["Source consumers (any PubSubConsumer)"]
+        K["KafkaConsumer<br/>KinesisConsumer"]
+        P["PulsarConsumer"]
+        G["GcpPubSubConsumer"]
+    end
+
+    DB["<b>DataBridge</b><br/>• owns connect / subscribe / close<br/>• polls each registration<br/>• rewrites attributes (provenance:<br/>&nbsp;&nbsp;BRIDGE_SOURCE_ID / _TOPIC / _CHANNEL)<br/>• publishes to Kafka, then acks the source"]
+
+    KT["Kafka backbone topic<br/><b>sourceId.channel</b><br/>auto-provisioned via BridgeTopicProvisioner"]
+
+    DC["Downstream analytics / AI consumers"]
+
+    K --> DB
+    P --> DB
+    G --> DB
+    DB --> KT
+    KT --> DC
 ```
 
 ### Core types
