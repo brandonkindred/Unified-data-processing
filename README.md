@@ -136,56 +136,37 @@ single-message, sync, and batch APIs.
 
 ## Architecture
 
-```
-+---------------------+   +-----------------------+   +-----------------+
-|  KafkaConsumer      |   |  PulsarConsumer       |   |  GcpPubSub      |
-|  KinesisConsumer    |   |  (any PubSubConsumer) |   |  Consumer       |
-+----------+----------+   +-----------+-----------+   +--------+--------+
-           \                          |                        /
-            \                         |                       /
-             v                        v                      v
-                 +-----------------------------------+
-                 |             DataBridge            |
-                 |  - owns connect/subscribe/close   |
-                 |  - polls each registration        |
-                 |  - rewrites attributes (provenance|
-                 |    BRIDGE_SOURCE_ID / _TOPIC /    |
-                 |    _CHANNEL)                      |
-                 |  - publishes to Kafka and only    |
-                 |    then acks the source           |
-                 +-----------------+-----------------+
-                                   |
-                                   v
-                       +-----------------------+
-                       | Kafka backbone topic  |
-                       | "sourceId.channel"    |
-                       | auto-provisioned via  |
-                       | BridgeTopicProvisioner|
-                       +-----------+-----------+
-                                   |
-                +------------------+------------------+
-                |                  |                  |
-                v                  v                  v
-       downstream analytics   +---------------------------+
-       / AI consumers         |          DataRelay        |
-                              |  - owns connect/sub/close |
-                              |  - polls each registration|
-                              |  - rewrites attributes    |
-                              |    (relay.destinationId / |
-                              |     _sourceTopic /        |
-                              |     _downstreamTopic)     |
-                              |  - publishes downstream   |
-                              |    and only then acks the |
-                              |    backbone consumer      |
-                              +--------------+------------+
-                                             |
-                          +------------------+------------------+
-                          |                  |                  |
-                          v                  v                  v
-                     +---------+      +-------------+      +---------+
-                     | Kafka / |      | Pulsar /    |      | Kinesis |
-                     | MSK     |      | GCP Pub/Sub |      | …       |
-                     +---------+      +-------------+      +---------+
+```mermaid
+flowchart TD
+    subgraph Sources["Source consumers (any PubSubConsumer)"]
+        K["KafkaConsumer<br/>KinesisConsumer"]
+        P["PulsarConsumer"]
+        G["GcpPubSubConsumer"]
+    end
+
+    DB["<b>DataBridge</b><br/>• owns connect / subscribe / close<br/>• polls each registration<br/>• rewrites attributes (provenance:<br/>&nbsp;&nbsp;BRIDGE_SOURCE_ID / _TOPIC / _CHANNEL)<br/>• publishes to Kafka, then acks the source"]
+
+    KT["Kafka backbone topic<br/><b>sourceId.channel</b><br/>auto-provisioned via BridgeTopicProvisioner"]
+
+    DC["Downstream analytics / AI consumers"]
+
+    DR["<b>DataRelay</b><br/>• owns connect / subscribe / close<br/>• polls each registration<br/>• rewrites attributes (provenance:<br/>&nbsp;&nbsp;RELAY_DESTINATION_ID / _SOURCE_TOPIC / _DOWNSTREAM_TOPIC)<br/>• publishes downstream, then acks the backbone"]
+
+    subgraph Destinations["Destination publishers (any PubSubPublisher)"]
+        DK["Kafka / MSK"]
+        DP["Pulsar / GCP Pub/Sub"]
+        DKi["Kinesis"]
+    end
+
+    K --> DB
+    P --> DB
+    G --> DB
+    DB --> KT
+    KT --> DC
+    KT --> DR
+    DR --> DK
+    DR --> DP
+    DR --> DKi
 ```
 
 ### Core types
