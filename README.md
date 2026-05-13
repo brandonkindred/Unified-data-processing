@@ -20,9 +20,8 @@ into a single Kafka backbone for downstream analytics and AI workloads.
 
 > Status: early development. The unified pub/sub adapters for Kafka, Amazon
 > MSK, Apache Pulsar, Google Cloud Pub/Sub, and AWS Kinesis are functional; the
-> `DataBridge` orchestrator runs end-to-end on a single-threaded poll loop and
-> is being hardened in subsequent chunks (per-registration threads, retry/
-> backoff, per-channel topic overrides).
+> `DataBridge` orchestrator runs each registration on its own poll thread with
+> per-channel topic overrides and at-least-once forwarding.
 
 ---
 
@@ -322,49 +321,84 @@ prevent messages *j ≠ i* from succeeding.
    only then `acknowledge(...)` on the source consumer (at-least-once).
 
 ```java
-import com.unifieddataprocessing.pubsub.bridge.*;
+import com.unifieddataprocessing.pubsub.PubSubConsumer;
+import com.unifieddataprocessing.pubsub.bridge.ChannelOptions;
+import com.unifieddataprocessing.pubsub.bridge.DataBridge;
+import com.unifieddataprocessing.pubsub.bridge.DataBridgeConfig;
+import com.unifieddataprocessing.pubsub.gcp.GcpPubSubConsumer;
+import com.unifieddataprocessing.pubsub.gcp.GcpPubSubConsumerConfig;
+import com.unifieddataprocessing.pubsub.kafka.KafkaConsumer;
+import com.unifieddataprocessing.pubsub.kafka.KafkaConsumerConfig;
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
-import java.time.Duration;
+
+KafkaProducerConfig producerCfg = new KafkaProducerConfig("kafka:9092");
 
 DataBridgeConfig cfg = DataBridgeConfig.builder()
-    .producerConfig(new KafkaProducerConfig("broker-1:9092"))
-    .defaultPartitions(6)
+    .producerConfig(producerCfg)
+    .defaultPartitions(3)
     .defaultReplicationFactor((short) 3)
-    .pollTimeout(Duration.ofSeconds(1))
-    .publishTimeout(Duration.ofSeconds(5))
-    .shutdownTimeout(Duration.ofSeconds(10))
-    .closeForceTimeout(Duration.ofSeconds(5))
     .build();
+
+// Each registered consumer must be freshly constructed — the bridge owns
+// connect/subscribe/close. Do NOT call those methods yourself.
+PubSubConsumer shopifyConsumer = new GcpPubSubConsumer(
+    new GcpPubSubConsumerConfig("my-gcp-project", "shopify-orders-sub"));
+PubSubConsumer salesforceConsumer = new KafkaConsumer(
+    new KafkaConsumerConfig("source-kafka:9092", "salesforce-leads-bridge"));
 
 try (DataBridge bridge = new DataBridge(cfg)) {
   bridge.register(
-      "billing",      // sourceId
-      "invoices",     // channel    -> Kafka topic "billing.invoices"
-      "raw-invoices", // sourceTopic on the source broker
-      pulsarConsumer, // any PubSubConsumer instance
-      ChannelOptions.defaults());
+      "shopify",                   // sourceId  (no '.' allowed)
+      "orders",                    // channel   -> Kafka topic "shopify.orders"
+      "shopify-orders-sub",        // sourceTopic on the source broker
+      shopifyConsumer,
+      ChannelOptions.builder().partitions(6).build());
 
   bridge.register(
-      "web", "clickstream", "events",
-      gcpPubSubConsumer,
-      ChannelOptions.defaults());
+      "salesforce",
+      "leads",                     //           -> Kafka topic "salesforce.leads"
+      "leads-stream",
+      salesforceConsumer,
+      ChannelOptions.defaults());  // uses defaultPartitions / defaultReplicationFactor
 
   bridge.start();
-  // ... bridge polls + republishes in the background
-}
+  // ... bridge polls + republishes in the background ...
+}                                  // close() flushes and closes everything
 ```
 
 ### Bridge semantics
 
-- The bridge **owns the lifecycle** of every registered consumer: it calls
-  `connect()`, `subscribe()`, and `close()`. Don't share consumer instances
-  across bridges, and don't call those methods yourself after registering.
-- `register(...)` must be called before `start()`. `start()` is once-only.
-- Failed start cleans up in reverse order (executor → consumers → publisher)
-  and leaves the bridge in `Closed`.
-- `close()` is idempotent: shuts down the executor (with `shutdownTimeout`
-  graceful + `closeForceTimeout` forced), flushes the publisher, closes every
-  consumer, then closes the publisher.
+1. **At-least-once delivery.** A source message is acked only after the bridge's
+   Kafka publish has been confirmed within `publishTimeout`. If the publish
+   times out or fails, the source is **not** acked, so a restart or rebalance
+   redelivers the record from the source's last-committed cursor.
+2. **Authoritative provenance headers.** The bridge stamps every published
+   message with `bridge.sourceId`, `bridge.sourceTopic`, and `bridge.channel`
+   (via `put`, overwriting any caller-supplied values). The string keys are
+   exposed as `BridgeAttributes.BRIDGE_SOURCE_ID` / `_SOURCE_TOPIC` / `_CHANNEL`
+   — downstream consumers can trust them.
+3. **Per-message ack precondition.** `PubSubConsumer.acknowledge(m)` must
+   commit only `m`, not any message delivered after it. Backends with
+   all-up-to-N ack semantics are unsupported (they would silently advance the
+   cursor past an unacked record).
+4. **Freshly-constructed-consumer precondition.** Each `PubSubConsumer`
+   instance you pass to `register(...)` must be newly constructed. Do **not**
+   call `connect()`, `subscribe()`, or `close()` on it before registration —
+   the bridge owns the entire lifecycle and will fail loudly if a consumer is
+   already connected.
+5. **`sourceId` cannot contain `.`.** `sourceId` must match
+   `^[a-zA-Z0-9_-]+$`; `channel` may contain `.` (`^[a-zA-Z0-9._-]+$`). This
+   keeps the prefix in the derived topic name `<sourceId>.<channel>`
+   unambiguous, so two different registrations can never derive the same
+   Kafka topic.
+6. **Single consumer instance per registration.** Registering the same
+   `PubSubConsumer` instance twice is rejected at `register()` time
+   (identity check). Build one consumer per registration.
+
+`register(...)` must be called before `start()`, and `start()` is once-only.
+`close()` is synchronized and idempotent: it shuts down the per-registration
+executor (graceful `shutdownTimeout` then forced `closeForceTimeout`), flushes
+the publisher, then closes every consumer and the publisher.
 
 ## Building from source
 
@@ -404,6 +438,9 @@ No external broker is required for the test suite.
 
 ## Project layout
 
+The library is organized as one core pub/sub module plus a per-broker adapter
+module for each supported broker, with the `bridge` package on top:
+
 ```
 src/main/java/com/unifieddataprocessing/pubsub/
 ├── Message.java                       core envelope
@@ -432,14 +469,13 @@ src/main/java/com/unifieddataprocessing/pubsub/
 
 ## Roadmap
 
-Work in progress; the items below are explicitly called out in the source as
-follow-up chunks:
+Near-term follow-ups tracked in the issue tracker:
 
-- One poll thread per registration on a fixed-size pool (and the
-  publisher concurrency contract that comes with it).
-- Per-channel topic-name overrides via `ChannelOptions`.
-- Poll/publish resilience (backoff, break-batch on publish failure).
-- KCL-based Kinesis consumer for production resharding/lease management.
+- Cap unacked-message bookkeeping in `DataBridge` during prolonged publish
+  outages so cursor-based sources (e.g. `KafkaConsumer`) don't grow unbounded
+  in-memory state.
+- KCL-based Kinesis consumer for production resharding / lease management.
+- Kafka → external publisher relay (the downstream half of the bridge).
 
 ## License
 
