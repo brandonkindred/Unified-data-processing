@@ -44,11 +44,12 @@ import org.apache.kafka.clients.admin.AdminClient;
  * {@code KafkaConsumer}, {@code KinesisConsumer}) during a sustained downstream outage, each
  * worker tracks consecutive publish failures per registration: once
  * {@link DataBridgeConfig#publishFailureThreshold()} is reached the worker sleeps for
- * {@link DataBridgeConfig#publishFailureCooldown()} before its next poll and resets the counter,
- * so polling pauses while the downstream stays broken and resumes automatically when it recovers.
- * A single successful publish resets the counter. Per-channel {@link ChannelOptions} layered over
- * the {@link DataBridgeConfig} defaults control each topic's partitions, replication factor, and
- * Kafka topic-configs at provision time.
+ * {@link DataBridgeConfig#publishFailureCooldown()} before its next poll. After cooldown the
+ * worker enters a probe state — the very next publish failure trips the breaker again — so a
+ * sustained outage adds at most one polled batch per cooldown cycle instead of {@code threshold}.
+ * A single successful publish drops the counter back to zero (healthy). Per-channel
+ * {@link ChannelOptions} layered over the {@link DataBridgeConfig} defaults control each topic's
+ * partitions, replication factor, and Kafka topic-configs at provision time.
  */
 public final class DataBridge implements AutoCloseable {
 
@@ -309,7 +310,12 @@ public final class DataBridge implements AutoCloseable {
             Thread.currentThread().interrupt();
             return;
           }
-          consecutivePublishFailures = 0;
+          // Probe state: after cooldown the very next publish failure trips
+          // the breaker again, so a sustained outage adds at most one polled
+          // batch of unacked bookkeeping per cooldown cycle (instead of up to
+          // `threshold` batches if we reset to zero). A single successful
+          // publish drops the counter back to zero on the next iteration.
+          consecutivePublishFailures = config.publishFailureThreshold() - 1;
         }
       } else {
         consecutivePublishFailures = 0;

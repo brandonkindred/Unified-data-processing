@@ -725,6 +725,81 @@ class DataBridgeTest {
   }
 
   @Test
+  void circuitBreaker_probeState_tripsAgainAfterSingleFailure() throws Exception {
+    // After the first cooldown, the worker enters a probe state: one publish
+    // failure (not `threshold` of them) trips the breaker again. With
+    // threshold=3 and an always-failing publisher, we should observe a
+    // cooldown approximately every 1 poll after the first trip, not every 3.
+    Duration cooldown = Duration.ofMillis(50);
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(20))
+            .publishTimeout(Duration.ofMillis(50))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .publishFailureThreshold(3)
+            .publishFailureCooldown(cooldown)
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chan");
+
+    Message m = msg("m-1", "topic-a", Map.of());
+    when(consumerA.poll(any(Duration.class))).thenReturn(List.of(m));
+
+    AtomicInteger publishCount = new AtomicInteger();
+    CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+    failed.completeExceptionally(new RuntimeException("publish-fail"));
+    when(mockPublisher.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              publishCount.incrementAndGet();
+              return failed;
+            });
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+
+    // Wait until at least 3 cooldown sleeps have happened.
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      synchronized (sleeper.sleeps) {
+        long count = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+        if (count >= 3) {
+          break;
+        }
+      }
+      Thread.sleep(10);
+    }
+    bridge.close();
+
+    long cooldownSleeps;
+    int publishes;
+    synchronized (sleeper.sleeps) {
+      cooldownSleeps = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+    }
+    publishes = publishCount.get();
+    assertTrue(
+        cooldownSleeps >= 3,
+        "expected >= 3 cooldowns under probe-state behavior; got " + cooldownSleeps);
+    // Under the old reset-to-zero behavior, observing 3 cooldowns would have
+    // required ~3 * threshold = 9 publishes. Under probe state, the first
+    // cooldown takes `threshold` publishes and each subsequent cooldown takes
+    // 1, so 3 cooldowns => <= threshold + (cooldownSleeps - 1) + a small
+    // slack for the trailing publish before close.
+    assertTrue(
+        publishes <= config.publishFailureThreshold() + cooldownSleeps + 1,
+        "probe state should keep publish count tight; cooldowns="
+            + cooldownSleeps
+            + " publishes="
+            + publishes);
+  }
+
+  @Test
   void circuitBreaker_resets_afterSuccessfulPublish() throws Exception {
     // Threshold 3 with a cyclic fail/fail/ok publish pattern. Counter climbs
     // to 2 then resets on the ok, so the breaker must never trip.
