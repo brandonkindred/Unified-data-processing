@@ -187,9 +187,6 @@ public class KinesisConsumer implements PubSubConsumer {
   public List<Message> poll(Duration timeout) {
     Objects.requireNonNull(timeout, "timeout");
     ensureConnected();
-    if (iteratorByShard.isEmpty()) {
-      return Collections.emptyList();
-    }
     // Defense-in-depth: when the caller has accumulated more polled-but-unacked
     // messages than the configured cap, re-acquire each shard iterator at the
     // lowest unacked sequence (highest acked, else lowest delivered, else the
@@ -200,6 +197,14 @@ public class KinesisConsumer implements PubSubConsumer {
     // publisher recovers. Without this re-acquire, the prior iterators have
     // already advanced past the unacked sequences, the bridge has discarded
     // the failed batch, and the registration would stall forever at the cap.
+    //
+    // This block runs BEFORE the iteratorByShard.isEmpty() short-circuit so
+    // the all-shards-closed case still recovers: when every shard that
+    // delivered unacked records returned nextShardIterator==null, those
+    // shards have been removed from iteratorByShard, but their records
+    // remain in deliveredSeqsByShard. The early-empty guard would otherwise
+    // return empty forever and recovery would never run.
+    //
     // cap == 0 disables.
     int cap = config.getMaxInFlightMessages();
     if (cap > 0 && shardSeqByMessageId.size() >= cap) {
@@ -208,18 +213,18 @@ public class KinesisConsumer implements PubSubConsumer {
       // all-or-nothing semantics: if acquireShardIterator throws (transient
       // AWS error) we leave bookkeeping intact so a future poll can retry.
       //
-      // Only re-acquire shards that have outstanding delivered-but-unacked
-      // records. For an untouched shard, resumePositionFor() would fall back
-      // to the configured starting position — and re-acquiring at LATEST
-      // skips every record that arrived between the previous iterator and
-      // this cap trip. Leave the existing iterator on untouched shards alone.
-      //
       // Iterate deliveredSeqsByShard rather than iteratorByShard so closed
       // shards (those whose GetRecords returned nextShardIterator == null
       // mid-stream and were therefore dropped from iteratorByShard) are also
       // re-acquired when they still hold unacked records. Without this,
       // the subsequent clear() would wipe their bookkeeping and the
       // unacked tail records would be permanently lost to the consumer.
+      //
+      // Only re-acquire shards that have outstanding delivered-but-unacked
+      // records. For an untouched shard, resumePositionFor() would fall back
+      // to the configured starting position — and re-acquiring at LATEST
+      // skips every record that arrived between the previous iterator and
+      // this cap trip. Leave the existing iterator on untouched shards alone.
       Map<String, KinesisStartingPosition> resumeByShard = new LinkedHashMap<>();
       for (Map.Entry<String, NavigableSet<BigInteger>> entry : deliveredSeqsByShard.entrySet()) {
         if (!entry.getValue().isEmpty()) {
@@ -241,6 +246,9 @@ public class KinesisConsumer implements PubSubConsumer {
       // let the next poll fire GetRecords immediately and trip the
       // 5-TPS-per-shard limit (ProvisionedThroughputExceededException) under
       // the exact outage scenario this cap is meant to handle.
+      return Collections.emptyList();
+    }
+    if (iteratorByShard.isEmpty()) {
       return Collections.emptyList();
     }
     long deadlineNanos = System.nanoTime() + timeout.toNanos();

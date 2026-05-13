@@ -863,6 +863,69 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void poll_atCap_reacquires_whenAllShardsClosed() {
+    // Single-shard stream where the only shard closes after delivering its
+    // first batch. iteratorByShard is now empty, but the unacked records
+    // are still in deliveredSeqsByShard. The at-cap recovery MUST run even
+    // though iteratorByShard.isEmpty() — otherwise poll() would short-circuit
+    // forever and the bridge could never redeliver the unacked tail.
+    KinesisConsumerConfig cappedConfig =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ZERO,
+            Map.of(),
+            2);
+    KinesisConsumer capped = new KinesisConsumer(cappedConfig, c -> mockClient);
+    capped.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0-REACQ").build());
+    Record r1 =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    Record r2 =
+        Record.builder()
+            .sequenceNumber("105")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("b"))
+            .build();
+    // First GetRecords returns 2 records AND closes the shard
+    // (nextShardIterator==null). After this, iteratorByShard is empty.
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(GetRecordsResponse.builder().records(r1, r2).build());
+    capped.subscribe(STREAM);
+
+    // Poll #1: shard delivers 2 records, returns null nextShardIterator,
+    // shard is dropped from iteratorByShard. Cap is reached (2 in-flight).
+    assertEquals(2, capped.poll(Duration.ofMillis(500)).size());
+
+    // Poll #2: iteratorByShard is empty, but the cap check must still run
+    // before the early-empty guard. The closed shard is re-acquired at
+    // AT_SEQUENCE_NUMBER on the lowest unacked sequence ("100").
+    assertTrue(capped.poll(Duration.ofMillis(500)).isEmpty());
+
+    ArgumentCaptor<GetShardIteratorRequest> captor =
+        ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+    verify(mockClient, times(2)).getShardIterator(captor.capture());
+    GetShardIteratorRequest reacquire = captor.getAllValues().get(1);
+    assertEquals("shard-0", reacquire.shardId());
+    assertEquals(ShardIteratorType.AT_SEQUENCE_NUMBER, reacquire.shardIteratorType());
+    assertEquals("100", reacquire.startingSequenceNumber());
+  }
+
+  @Test
   void poll_atCap_reacquiresClosedShardWithOutstandingRecords() {
     // A shard can deliver its last batch with nextShardIterator()==null
     // (closed mid-stream); we drop it from iteratorByShard but its unacked
