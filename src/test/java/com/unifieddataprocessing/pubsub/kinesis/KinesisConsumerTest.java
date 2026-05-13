@@ -863,6 +863,103 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void poll_atCap_reacquiresClosedShardWithOutstandingRecords() {
+    // A shard can deliver its last batch with nextShardIterator()==null
+    // (closed mid-stream); we drop it from iteratorByShard but its unacked
+    // records remain in deliveredSeqsByShard. If the cap then trips on the
+    // other shard, the closed shard's tail records must still be
+    // redeliverable — otherwise the subsequent clear() permanently loses
+    // them. The at-cap re-acquire must include closed-but-not-drained
+    // shards so the next poll redelivers their tail.
+    KinesisConsumerConfig cappedConfig =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ZERO,
+            Map.of(),
+            2);
+    KinesisConsumer capped = new KinesisConsumer(cappedConfig, c -> mockClient);
+    capped.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(
+                    Shard.builder().shardId("shard-0").build(),
+                    Shard.builder().shardId("shard-1").build())
+                .build());
+    // Two subscribe-time iterators, then two re-acquires at the cap trip
+    // (both shards have outstanding bookkeeping; the closed shard-0 is the
+    // case under test — it must NOT be skipped just because it was dropped
+    // from iteratorByShard when it returned nextShardIterator==null).
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-S0").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-S1").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-S0-REACQ").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-S1-REACQ").build());
+
+    Record s0r1 =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    Record s1r1 =
+        Record.builder()
+            .sequenceNumber("200")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("b"))
+            .build();
+    // shard-0 returns one record and nextShardIterator=null (closed mid-stream).
+    // shard-1 returns one record with a valid next iterator.
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenAnswer(
+            inv -> {
+              String iter = inv.getArgument(0, GetRecordsRequest.class).shardIterator();
+              if ("ITER-S0".equals(iter)) {
+                return GetRecordsResponse.builder().records(s0r1).build();
+              }
+              if ("ITER-S1".equals(iter)) {
+                return GetRecordsResponse.builder()
+                    .records(s1r1)
+                    .nextShardIterator("ITER-S1-NEXT")
+                    .build();
+              }
+              return GetRecordsResponse.builder().nextShardIterator(iter + "-NEXT").build();
+            });
+    capped.subscribe(STREAM);
+
+    // Poll #1: shard-0 delivers 1 record + closes; shard-1 delivers 1 record.
+    // Cap is reached (2 in-flight).
+    assertEquals(2, capped.poll(Duration.ofMillis(500)).size());
+
+    // Poll #2: at-cap path. Must re-acquire the closed shard-0 (which has
+    // outstanding bookkeeping despite being dropped from iteratorByShard),
+    // NOT just shard-1.
+    assertTrue(capped.poll(Duration.ofMillis(500)).isEmpty());
+
+    ArgumentCaptor<GetShardIteratorRequest> captor =
+        ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+    verify(mockClient, times(4)).getShardIterator(captor.capture());
+    // Skip the two subscribe-time iterator requests; the remaining two are
+    // the at-cap re-acquires. Both shards have unacked records, so both
+    // get re-acquired (the key assertion: closed shard-0 is included).
+    List<GetShardIteratorRequest> reacquires = captor.getAllValues().subList(2, 4);
+    Map<String, GetShardIteratorRequest> byShard =
+        reacquires.stream()
+            .collect(java.util.stream.Collectors.toMap(GetShardIteratorRequest::shardId, r -> r));
+    assertTrue(
+        byShard.containsKey("shard-0"),
+        "closed shard-0 with outstanding bookkeeping must be re-acquired at the cap trip");
+    assertEquals(ShardIteratorType.AT_SEQUENCE_NUMBER, byShard.get("shard-0").shardIteratorType());
+    assertEquals("100", byShard.get("shard-0").startingSequenceNumber());
+    assertEquals(ShardIteratorType.AT_SEQUENCE_NUMBER, byShard.get("shard-1").shardIteratorType());
+    assertEquals("200", byShard.get("shard-1").startingSequenceNumber());
+  }
+
+  @Test
   void poll_atCap_doesNotReacquireUntouchedShardsAtLatest() {
     // With starting position LATEST and two shards, if only one shard has
     // delivered records when the cap is hit, the at-cap re-acquire must NOT

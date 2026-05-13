@@ -213,11 +213,17 @@ public class KinesisConsumer implements PubSubConsumer {
       // to the configured starting position — and re-acquiring at LATEST
       // skips every record that arrived between the previous iterator and
       // this cap trip. Leave the existing iterator on untouched shards alone.
+      //
+      // Iterate deliveredSeqsByShard rather than iteratorByShard so closed
+      // shards (those whose GetRecords returned nextShardIterator == null
+      // mid-stream and were therefore dropped from iteratorByShard) are also
+      // re-acquired when they still hold unacked records. Without this,
+      // the subsequent clear() would wipe their bookkeeping and the
+      // unacked tail records would be permanently lost to the consumer.
       Map<String, KinesisStartingPosition> resumeByShard = new LinkedHashMap<>();
-      for (String shardId : iteratorByShard.keySet()) {
-        NavigableSet<BigInteger> delivered = deliveredSeqsByShard.get(shardId);
-        if (delivered != null && !delivered.isEmpty()) {
-          resumeByShard.put(shardId, resumePositionFor(shardId));
+      for (Map.Entry<String, NavigableSet<BigInteger>> entry : deliveredSeqsByShard.entrySet()) {
+        if (!entry.getValue().isEmpty()) {
+          resumeByShard.put(entry.getKey(), resumePositionFor(entry.getKey()));
         }
       }
       Map<String, String> newIterators = new LinkedHashMap<>();
