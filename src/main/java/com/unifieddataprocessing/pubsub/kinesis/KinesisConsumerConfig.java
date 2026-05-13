@@ -30,6 +30,7 @@ public final class KinesisConsumerConfig {
   private final int getRecordsLimit;
   private final Duration getRecordsMinInterval;
   private final Map<String, KinesisStartingPosition> startingPositionByShard;
+  private final int maxInFlightMessages;
 
   /** Creates a config with {@link KinesisStartingPosition#latest()} and all defaults. */
   public KinesisConsumerConfig(
@@ -98,6 +99,35 @@ public final class KinesisConsumerConfig {
       int getRecordsLimit,
       Duration getRecordsMinInterval,
       Map<String, KinesisStartingPosition> startingPositionByShard) {
+    this(
+        streamName,
+        region,
+        credentialsProvider,
+        startingPosition,
+        getRecordsLimit,
+        getRecordsMinInterval,
+        startingPositionByShard,
+        0);
+  }
+
+  /**
+   * Full configuration including the in-flight cap. {@code maxInFlightMessages} bounds the number
+   * of polled-but-unacked messages: when at-or-above the cap,
+   * {@link KinesisConsumer#poll(Duration)} re-acquires each shard iterator at the lowest unacked
+   * sequence, clears its in-memory bookkeeping, and returns empty — the next poll redelivers from
+   * the unacked sequence so the per-message and per-shard maps cannot grow without bound during a
+   * prolonged downstream outage while still allowing the registration to recover once the
+   * publisher comes back. {@code 0} disables the cap.
+   */
+  public KinesisConsumerConfig(
+      String streamName,
+      Region region,
+      AwsCredentialsProvider credentialsProvider,
+      KinesisStartingPosition startingPosition,
+      int getRecordsLimit,
+      Duration getRecordsMinInterval,
+      Map<String, KinesisStartingPosition> startingPositionByShard,
+      int maxInFlightMessages) {
     this.streamName = Objects.requireNonNull(streamName, "streamName");
     this.region = Objects.requireNonNull(region, "region");
     this.credentialsProvider = Objects.requireNonNull(credentialsProvider, "credentialsProvider");
@@ -116,6 +146,11 @@ public final class KinesisConsumerConfig {
         startingPositionByShard == null
             ? Collections.emptyMap()
             : Collections.unmodifiableMap(new LinkedHashMap<>(startingPositionByShard));
+    if (maxInFlightMessages < 0) {
+      throw new IllegalArgumentException(
+          "maxInFlightMessages must be >= 0, got " + maxInFlightMessages);
+    }
+    this.maxInFlightMessages = maxInFlightMessages;
   }
 
   public String getStreamName() {
@@ -144,5 +179,14 @@ public final class KinesisConsumerConfig {
 
   public Map<String, KinesisStartingPosition> getStartingPositionByShard() {
     return startingPositionByShard;
+  }
+
+  /**
+   * In-flight cap above which {@link KinesisConsumer#poll(Duration)} re-acquires each shard
+   * iterator at the lowest unacked sequence, clears bookkeeping, and returns empty for that call.
+   * {@code 0} means uncapped.
+   */
+  public int getMaxInFlightMessages() {
+    return maxInFlightMessages;
   }
 }

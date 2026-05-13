@@ -40,9 +40,16 @@ import org.apache.kafka.clients.admin.AdminClient;
  * N worker threads and relies on the underlying Kafka client being thread-safe for {@code send}.
  * A failing {@code poll(...)} backs off via the injected {@link Sleeper} and retries; a failing
  * {@code publish(...)} (timeout or execution failure) breaks the current batch without acking, so
- * the source will redeliver. Per-channel {@link ChannelOptions} layered over the
- * {@link DataBridgeConfig} defaults control each topic's partitions, replication factor, and Kafka
- * topic-configs at provision time.
+ * the source will redeliver. To bound in-memory bookkeeping growth on cursor-based sources (e.g.
+ * {@code KafkaConsumer}, {@code KinesisConsumer}) during a sustained downstream outage, each
+ * worker tracks consecutive publish failures per registration: once
+ * {@link DataBridgeConfig#publishFailureThreshold()} is reached the worker sleeps for
+ * {@link DataBridgeConfig#publishFailureCooldown()} before its next poll. After cooldown the
+ * worker enters a probe state — the very next publish failure trips the breaker again — so a
+ * sustained outage adds at most one polled batch per cooldown cycle instead of {@code threshold}.
+ * A single successful publish drops the counter back to zero (healthy). Per-channel
+ * {@link ChannelOptions} layered over the {@link DataBridgeConfig} defaults control each topic's
+ * partitions, replication factor, and Kafka topic-configs at provision time.
  */
 public final class DataBridge implements AutoCloseable {
 
@@ -54,6 +61,17 @@ public final class DataBridge implements AutoCloseable {
     Running,
     Closed
   }
+
+  /**
+   * Outcome of a single {@code processBatch(...)} call as observed by {@link #pollLoopForever}.
+   * {@code interrupted} short-circuits the loop. Otherwise the circuit-breaker uses the two
+   * booleans to decide its next state: a publish success anywhere in the batch resets the
+   * consecutive-failure counter, and a publish failure increments it. An empty batch (no
+   * messages polled) reports both flags as {@code false} so intermittent traffic during a
+   * sustained outage cannot reset the counter without an actual successful publish.
+   */
+  private record BatchResult(
+      boolean anyPublishSucceeded, boolean publishFailed, boolean interrupted) {}
 
   private final DataBridgeConfig config;
   private final Function<KafkaProducerConfig, PubSubPublisher> publisherFactory;
@@ -258,6 +276,7 @@ public final class DataBridge implements AutoCloseable {
   }
 
   private void pollLoopForever(Registration reg, PubSubPublisher pub) {
+    int consecutivePublishFailures = 0;
     while (state == State.Running) {
       List<Message> batch;
       try {
@@ -272,33 +291,68 @@ public final class DataBridge implements AutoCloseable {
         }
         continue;
       }
-      if (!processBatch(reg, pub, batch)) {
+      BatchResult result = processBatch(reg, pub, batch);
+      if (result.interrupted()) {
         return;
+      }
+      // A successful publish anywhere in the batch breaks any in-progress
+      // failure streak. An empty batch reports both flags false and leaves
+      // the counter alone — without this, intermittent traffic during a
+      // sustained outage would reset the streak on every empty poll and
+      // the breaker would never trip.
+      if (result.anyPublishSucceeded()) {
+        consecutivePublishFailures = 0;
+      }
+      if (result.publishFailed()) {
+        consecutivePublishFailures++;
+        if (consecutivePublishFailures >= config.publishFailureThreshold()) {
+          LOG.log(
+              Level.WARNING,
+              "circuit-breaker engaged for {0} after {1} consecutive publish failures; "
+                  + "pausing polling for {2}",
+              new Object[] {
+                reg.targetTopic(), consecutivePublishFailures, config.publishFailureCooldown()
+              });
+          try {
+            sleeper.sleep(config.publishFailureCooldown());
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return;
+          }
+          // Probe state: after cooldown the very next publish failure trips
+          // the breaker again, so a sustained outage adds at most one polled
+          // batch of unacked bookkeeping per cooldown cycle (instead of up to
+          // `threshold` batches if we reset to zero). A single successful
+          // publish drops the counter back to zero on the next iteration.
+          consecutivePublishFailures = config.publishFailureThreshold() - 1;
+        }
       }
     }
   }
 
-  private boolean processBatch(Registration reg, PubSubPublisher pub, List<Message> batch) {
+  private BatchResult processBatch(Registration reg, PubSubPublisher pub, List<Message> batch) {
+    boolean anyPublishSucceeded = false;
     for (Message m : batch) {
       if (state != State.Running) {
-        return true;
+        return new BatchResult(anyPublishSucceeded, false, false);
       }
       Message rewritten = MessageRewriter.rewrite(m, reg);
       try {
         pub.publish(rewritten).get(config.publishTimeout().toMillis(), TimeUnit.MILLISECONDS);
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
-        return false;
+        return new BatchResult(anyPublishSucceeded, false, true);
       } catch (ExecutionException | TimeoutException e) {
         LOG.log(
             Level.WARNING,
             "publish failed for " + reg.targetTopic() + "; breaking batch (no ack)",
             e);
-        return true;
+        return new BatchResult(anyPublishSucceeded, true, false);
       }
+      anyPublishSucceeded = true;
       reg.consumer().acknowledge(m);
     }
-    return true;
+    return new BatchResult(anyPublishSucceeded, false, false);
   }
 
   private static boolean awaitQuietly(ExecutorService exec, long millis) {

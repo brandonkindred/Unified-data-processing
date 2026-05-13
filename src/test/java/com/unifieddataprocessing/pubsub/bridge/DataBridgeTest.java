@@ -666,4 +666,411 @@ class DataBridgeTest {
         nt.configs() == null || nt.configs().isEmpty(),
         "unset topicConfigs should remain empty");
   }
+
+  @Test
+  void publishFailures_engageCircuitBreaker_afterThreshold() throws Exception {
+    // Threshold 3: after 3 consecutive publish failures the worker should sleep
+    // for publishFailureCooldown exactly once. Tight publishTimeout so the
+    // timed-out get() returns fast.
+    Duration cooldown = Duration.ofMillis(123);
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(20))
+            .publishTimeout(Duration.ofMillis(50))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .publishFailureThreshold(3)
+            .publishFailureCooldown(cooldown)
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chan");
+
+    Message m = msg("m-1", "topic-a", Map.of());
+    when(consumerA.poll(any(Duration.class))).thenReturn(List.of(m));
+
+    // Every publish fails with ExecutionException.
+    CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+    failed.completeExceptionally(new RuntimeException("downstream-down"));
+    when(mockPublisher.publish(any(Message.class))).thenReturn(failed);
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+
+    // Wait until the breaker has tripped at least once (a cooldown-duration
+    // sleep appears) and then close.
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      synchronized (sleeper.sleeps) {
+        if (sleeper.sleeps.contains(cooldown)) {
+          break;
+        }
+      }
+      Thread.sleep(10);
+    }
+    bridge.close();
+
+    long cooldownSleeps;
+    synchronized (sleeper.sleeps) {
+      cooldownSleeps = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+    }
+    assertTrue(
+        cooldownSleeps >= 1,
+        "expected at least one cooldown-duration sleep, got " + cooldownSleeps);
+    verify(consumerA, never()).acknowledge(any(Message.class));
+  }
+
+  @Test
+  void circuitBreaker_emptyPollsDoNotResetCounter() throws Exception {
+    // Intermittent traffic during a sustained outage: every other poll is
+    // empty. An empty poll must NOT reset the consecutive-failure counter —
+    // otherwise the breaker would never trip and the cursor consumer keeps
+    // accumulating unacked bookkeeping. Threshold 3, every fail-poll fails,
+    // every other poll is empty: the breaker must engage within ~3
+    // fail-polls (6 total polls).
+    Duration cooldown = Duration.ofMillis(80);
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(20))
+            .publishTimeout(Duration.ofMillis(50))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .publishFailureThreshold(3)
+            .publishFailureCooldown(cooldown)
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chan");
+
+    Message m = msg("m-1", "topic-a", Map.of());
+    AtomicInteger pollCount = new AtomicInteger();
+    when(consumerA.poll(any(Duration.class)))
+        .thenAnswer(
+            inv -> {
+              int n = pollCount.incrementAndGet();
+              // Alternate non-empty / empty: 1=msg, 2=empty, 3=msg, 4=empty, ...
+              return (n % 2 == 1) ? List.of(m) : List.of();
+            });
+
+    CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+    failed.completeExceptionally(new RuntimeException("publish-fail"));
+    when(mockPublisher.publish(any(Message.class))).thenReturn(failed);
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      synchronized (sleeper.sleeps) {
+        if (sleeper.sleeps.contains(cooldown)) {
+          break;
+        }
+      }
+      Thread.sleep(10);
+    }
+    bridge.close();
+
+    long cooldownSleeps;
+    synchronized (sleeper.sleeps) {
+      cooldownSleeps = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+    }
+    assertTrue(
+        cooldownSleeps >= 1,
+        "breaker should trip despite empty polls interleaved with failures; cooldownSleeps="
+            + cooldownSleeps);
+  }
+
+  @Test
+  void circuitBreaker_probeState_tripsAgainAfterSingleFailure() throws Exception {
+    // After the first cooldown, the worker enters a probe state: one publish
+    // failure (not `threshold` of them) trips the breaker again. With
+    // threshold=3 and an always-failing publisher, we should observe a
+    // cooldown approximately every 1 poll after the first trip, not every 3.
+    Duration cooldown = Duration.ofMillis(50);
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(20))
+            .publishTimeout(Duration.ofMillis(50))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .publishFailureThreshold(3)
+            .publishFailureCooldown(cooldown)
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chan");
+
+    Message m = msg("m-1", "topic-a", Map.of());
+    when(consumerA.poll(any(Duration.class))).thenReturn(List.of(m));
+
+    AtomicInteger publishCount = new AtomicInteger();
+    CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+    failed.completeExceptionally(new RuntimeException("publish-fail"));
+    when(mockPublisher.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              publishCount.incrementAndGet();
+              return failed;
+            });
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+
+    // Wait until at least 3 cooldown sleeps have happened.
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      synchronized (sleeper.sleeps) {
+        long count = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+        if (count >= 3) {
+          break;
+        }
+      }
+      Thread.sleep(10);
+    }
+    bridge.close();
+
+    long cooldownSleeps;
+    int publishes;
+    synchronized (sleeper.sleeps) {
+      cooldownSleeps = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+    }
+    publishes = publishCount.get();
+    assertTrue(
+        cooldownSleeps >= 3,
+        "expected >= 3 cooldowns under probe-state behavior; got " + cooldownSleeps);
+    // Under the old reset-to-zero behavior, observing 3 cooldowns would have
+    // required ~3 * threshold = 9 publishes. Under probe state, the first
+    // cooldown takes `threshold` publishes and each subsequent cooldown takes
+    // 1, so 3 cooldowns => <= threshold + (cooldownSleeps - 1) + a small
+    // slack for the trailing publish before close.
+    assertTrue(
+        publishes <= config.publishFailureThreshold() + cooldownSleeps + 1,
+        "probe state should keep publish count tight; cooldowns="
+            + cooldownSleeps
+            + " publishes="
+            + publishes);
+  }
+
+  @Test
+  void circuitBreaker_resets_afterSuccessfulPublish() throws Exception {
+    // Threshold 3 with a cyclic fail/fail/ok publish pattern. Counter climbs
+    // to 2 then resets on the ok, so the breaker must never trip.
+    Duration cooldown = Duration.ofMillis(777);
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(20))
+            .publishTimeout(Duration.ofMillis(50))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .publishFailureThreshold(3)
+            .publishFailureCooldown(cooldown)
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chan");
+
+    Message m = msg("m-1", "topic-a", Map.of());
+    when(consumerA.poll(any(Duration.class))).thenReturn(List.of(m));
+
+    AtomicInteger publishCount = new AtomicInteger();
+    when(mockPublisher.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              int n = publishCount.incrementAndGet();
+              if (n % 3 == 0) {
+                return CompletableFuture.completedFuture(null);
+              }
+              CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+              failed.completeExceptionally(new RuntimeException("publish-fail"));
+              return failed;
+            });
+
+    CountDownLatch ackLatch = new CountDownLatch(3);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+    assertTrue(
+        ackLatch.await(5, TimeUnit.SECONDS),
+        "every third publish succeeds; counter resets so the worker keeps acking");
+    bridge.close();
+
+    long cooldownSleeps;
+    synchronized (sleeper.sleeps) {
+      cooldownSleeps = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+    }
+    assertEquals(
+        0,
+        cooldownSleeps,
+        "successful publish should have reset the failure counter; cooldown should not trip");
+  }
+
+  @Test
+  void circuitBreakerCooldown_interruptible_onShutdown() throws Exception {
+    // Long cooldown — close() must interrupt the cooldown sleep and bring the
+    // worker down inside the configured shutdown budget instead of waiting it
+    // out. Threshold 1 to trip on the first failure.
+    Duration cooldown = Duration.ofSeconds(60);
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(20))
+            .publishTimeout(Duration.ofMillis(50))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .publishFailureThreshold(1)
+            .publishFailureCooldown(cooldown)
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chan");
+
+    Message m = msg("m-1", "topic-a", Map.of());
+    when(consumerA.poll(any(Duration.class))).thenReturn(List.of(m));
+
+    CountDownLatch publishLatch = new CountDownLatch(1);
+    CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+    failed.completeExceptionally(new RuntimeException("publish-fail"));
+    when(mockPublisher.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              publishLatch.countDown();
+              return failed;
+            });
+
+    // A sleeper that blocks like Thread.sleep but reacts to interrupt.
+    Sleeper realSleeper = d -> TimeUnit.NANOSECONDS.sleep(d.toNanos());
+
+    DataBridge bridge = newBridge(realSleeper);
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+    // Wait until at least one publish has occurred (= worker is in cooldown).
+    assertTrue(
+        publishLatch.await(2, TimeUnit.SECONDS), "worker should publish-fail and enter cooldown");
+
+    long t0 = System.nanoTime();
+    bridge.close();
+    long elapsedNs = System.nanoTime() - t0;
+
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofMillis(500));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() took "
+            + Duration.ofNanos(elapsedNs)
+            + " but budget is "
+            + budget
+            + " (cooldown sleep should be interrupted)");
+  }
+
+  @Test
+  void circuitBreaker_perRegistration_doesNotPauseHealthyOne() throws Exception {
+    // Two registrations: A's publishes always succeed, B's always fail. B's
+    // breaker engages but A keeps making progress on its own worker. Threshold 1
+    // so B trips quickly; cooldown short so the test stays fast.
+    Duration cooldown = Duration.ofMillis(50);
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(20))
+            .publishTimeout(Duration.ofMillis(50))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .publishFailureThreshold(1)
+            .publishFailureCooldown(cooldown)
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chanA", "src.chanB");
+
+    AtomicInteger counter = new AtomicInteger();
+    when(consumerA.poll(any(Duration.class)))
+        .thenAnswer(
+            inv -> List.of(msg("a-" + counter.incrementAndGet(), "topic-a", Map.of())));
+    when(consumerB.poll(any(Duration.class)))
+        .thenReturn(List.of(msg("b-1", "topic-b", Map.of())));
+
+    CompletableFuture<PublishResult> failedFuture = new CompletableFuture<>();
+    failedFuture.completeExceptionally(new RuntimeException("b-down"));
+    // Publisher.publish: any message destined to src.chanA succeeds; src.chanB fails.
+    when(mockPublisher.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              Message published = inv.getArgument(0);
+              if ("src.chanB".equals(published.getTopic())) {
+                return failedFuture;
+              }
+              return CompletableFuture.completedFuture(null);
+            });
+
+    CountDownLatch ackLatchA = new CountDownLatch(3);
+    doAnswer(
+            inv -> {
+              ackLatchA.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    // Real two-thread pool so the two workers don't serialize.
+    singleThreadFactory = n -> Executors.newFixedThreadPool(n);
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chanA", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.register("src", "chanB", "topic-b", consumerB, ChannelOptions.defaults());
+    bridge.start();
+
+    assertTrue(
+        ackLatchA.await(5, TimeUnit.SECONDS),
+        "source A should ack >= 3 times while source B is in cooldown");
+    // Wait for B's cooldown to actually appear. Under tight scheduling, A can
+    // finish 3 acks before B's worker is even scheduled, so we can't infer
+    // from A's progress alone that B has reached the breaker.
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      synchronized (sleeper.sleeps) {
+        if (sleeper.sleeps.contains(cooldown)) {
+          break;
+        }
+      }
+      Thread.sleep(10);
+    }
+    bridge.close();
+
+    verify(consumerA, atLeast(3)).acknowledge(any(Message.class));
+    verify(consumerB, never()).acknowledge(any(Message.class));
+    long cooldownSleeps;
+    synchronized (sleeper.sleeps) {
+      cooldownSleeps = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+    }
+    assertTrue(
+        cooldownSleeps >= 1,
+        "source B should have hit its circuit-breaker at least once; cooldownSleeps="
+            + cooldownSleeps);
+  }
 }
