@@ -863,6 +863,89 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void poll_atCap_doesNotReacquireUntouchedShardsAtLatest() {
+    // With starting position LATEST and two shards, if only one shard has
+    // delivered records when the cap is hit, the at-cap re-acquire must NOT
+    // touch the idle shard's iterator. Re-acquiring at LATEST would skip
+    // any records that landed on the idle shard between its previous
+    // iterator and this cap trip — silently losing data.
+    KinesisConsumerConfig cappedLatest =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.latest(),
+            100,
+            Duration.ZERO,
+            Map.of(),
+            2);
+    KinesisConsumer capped = new KinesisConsumer(cappedLatest, c -> mockClient);
+    capped.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(
+                    Shard.builder().shardId("shard-0").build(),
+                    Shard.builder().shardId("shard-1").build())
+                .build());
+    // Two subscribe-time iterators (one per shard), then one re-acquire for
+    // the busy shard at the cap trip. The idle shard must not get a fourth.
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-S0").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-S1").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-S0-REACQ").build());
+
+    Record r1 =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    Record r2 =
+        Record.builder()
+            .sequenceNumber("105")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("b"))
+            .build();
+    // shard-0 delivers records; shard-1 returns empty. Then both idle.
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenAnswer(
+            inv -> {
+              String iter = inv.getArgument(0, GetRecordsRequest.class).shardIterator();
+              if ("ITER-S0".equals(iter)) {
+                return GetRecordsResponse.builder()
+                    .records(r1, r2)
+                    .nextShardIterator("ITER-S0-NEXT")
+                    .build();
+              }
+              return GetRecordsResponse.builder().nextShardIterator(iter + "-NEXT").build();
+            });
+    capped.subscribe(STREAM);
+
+    // Poll #1: shard-0 delivers 2 records; shard-1 empty. Cap is reached
+    // (shard-0 has 2 in-flight).
+    assertEquals(2, capped.poll(Duration.ofMillis(10)).size());
+
+    // Poll #2: at-cap path. Must re-acquire shard-0 (which has bookkeeping)
+    // but NOT shard-1 (idle).
+    assertTrue(capped.poll(Duration.ofMillis(10)).isEmpty());
+
+    ArgumentCaptor<GetShardIteratorRequest> captor =
+        ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+    verify(mockClient, times(3)).getShardIterator(captor.capture());
+    // First two calls are at subscribe (one per shard); the third is the
+    // re-acquire for shard-0 only.
+    GetShardIteratorRequest reacquire = captor.getAllValues().get(2);
+    assertEquals("shard-0", reacquire.shardId());
+    assertEquals(ShardIteratorType.AT_SEQUENCE_NUMBER, reacquire.shardIteratorType());
+    assertEquals("100", reacquire.startingSequenceNumber());
+    // The only shard-1 iterator request is the subscribe-time one (LATEST).
+    long shard1Requests =
+        captor.getAllValues().stream().filter(r -> "shard-1".equals(r.shardId())).count();
+    assertEquals(1, shard1Requests, "shard-1 must not be re-acquired at the cap trip");
+  }
+
+  @Test
   void poll_preservesPerShardThrottle_acrossInFlightCapReacquire() {
     // After the at-cap re-acquire, the next GetRecords call must still
     // respect the per-shard min-interval established by the previous

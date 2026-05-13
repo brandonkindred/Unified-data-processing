@@ -207,9 +207,18 @@ public class KinesisConsumer implements PubSubConsumer {
       // before mutating consumer state, mirroring subscribe()'s
       // all-or-nothing semantics: if acquireShardIterator throws (transient
       // AWS error) we leave bookkeeping intact so a future poll can retry.
+      //
+      // Only re-acquire shards that have outstanding delivered-but-unacked
+      // records. For an untouched shard, resumePositionFor() would fall back
+      // to the configured starting position — and re-acquiring at LATEST
+      // skips every record that arrived between the previous iterator and
+      // this cap trip. Leave the existing iterator on untouched shards alone.
       Map<String, KinesisStartingPosition> resumeByShard = new LinkedHashMap<>();
       for (String shardId : iteratorByShard.keySet()) {
-        resumeByShard.put(shardId, resumePositionFor(shardId));
+        NavigableSet<BigInteger> delivered = deliveredSeqsByShard.get(shardId);
+        if (delivered != null && !delivered.isEmpty()) {
+          resumeByShard.put(shardId, resumePositionFor(shardId));
+        }
       }
       Map<String, String> newIterators = new LinkedHashMap<>();
       for (Map.Entry<String, KinesisStartingPosition> entry : resumeByShard.entrySet()) {
