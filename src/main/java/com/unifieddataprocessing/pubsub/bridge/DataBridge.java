@@ -62,15 +62,16 @@ public final class DataBridge implements AutoCloseable {
     Closed
   }
 
-  /** Outcome of a single {@code processBatch(...)} call as observed by {@link #pollLoopForever}. */
-  private enum BatchOutcome {
-    /** Every message in the batch was published and acked, or the batch was empty. */
-    Ok,
-    /** A publish timed out or failed; the batch was broken without acking. */
-    PublishFailed,
-    /** Worker thread was interrupted (e.g. shutdown); the worker must exit. */
-    Interrupted
-  }
+  /**
+   * Outcome of a single {@code processBatch(...)} call as observed by {@link #pollLoopForever}.
+   * {@code interrupted} short-circuits the loop. Otherwise the circuit-breaker uses the two
+   * booleans to decide its next state: a publish success anywhere in the batch resets the
+   * consecutive-failure counter, and a publish failure increments it. An empty batch (no
+   * messages polled) reports both flags as {@code false} so intermittent traffic during a
+   * sustained outage cannot reset the counter without an actual successful publish.
+   */
+  private record BatchResult(
+      boolean anyPublishSucceeded, boolean publishFailed, boolean interrupted) {}
 
   private final DataBridgeConfig config;
   private final Function<KafkaProducerConfig, PubSubPublisher> publisherFactory;
@@ -290,11 +291,19 @@ public final class DataBridge implements AutoCloseable {
         }
         continue;
       }
-      BatchOutcome outcome = processBatch(reg, pub, batch);
-      if (outcome == BatchOutcome.Interrupted) {
+      BatchResult result = processBatch(reg, pub, batch);
+      if (result.interrupted()) {
         return;
       }
-      if (outcome == BatchOutcome.PublishFailed) {
+      // A successful publish anywhere in the batch breaks any in-progress
+      // failure streak. An empty batch reports both flags false and leaves
+      // the counter alone — without this, intermittent traffic during a
+      // sustained outage would reset the streak on every empty poll and
+      // the breaker would never trip.
+      if (result.anyPublishSucceeded()) {
+        consecutivePublishFailures = 0;
+      }
+      if (result.publishFailed()) {
         consecutivePublishFailures++;
         if (consecutivePublishFailures >= config.publishFailureThreshold()) {
           LOG.log(
@@ -317,33 +326,33 @@ public final class DataBridge implements AutoCloseable {
           // publish drops the counter back to zero on the next iteration.
           consecutivePublishFailures = config.publishFailureThreshold() - 1;
         }
-      } else {
-        consecutivePublishFailures = 0;
       }
     }
   }
 
-  private BatchOutcome processBatch(Registration reg, PubSubPublisher pub, List<Message> batch) {
+  private BatchResult processBatch(Registration reg, PubSubPublisher pub, List<Message> batch) {
+    boolean anyPublishSucceeded = false;
     for (Message m : batch) {
       if (state != State.Running) {
-        return BatchOutcome.Ok;
+        return new BatchResult(anyPublishSucceeded, false, false);
       }
       Message rewritten = MessageRewriter.rewrite(m, reg);
       try {
         pub.publish(rewritten).get(config.publishTimeout().toMillis(), TimeUnit.MILLISECONDS);
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
-        return BatchOutcome.Interrupted;
+        return new BatchResult(anyPublishSucceeded, false, true);
       } catch (ExecutionException | TimeoutException e) {
         LOG.log(
             Level.WARNING,
             "publish failed for " + reg.targetTopic() + "; breaking batch (no ack)",
             e);
-        return BatchOutcome.PublishFailed;
+        return new BatchResult(anyPublishSucceeded, true, false);
       }
+      anyPublishSucceeded = true;
       reg.consumer().acknowledge(m);
     }
-    return BatchOutcome.Ok;
+    return new BatchResult(anyPublishSucceeded, false, false);
   }
 
   private static boolean awaitQuietly(ExecutorService exec, long millis) {

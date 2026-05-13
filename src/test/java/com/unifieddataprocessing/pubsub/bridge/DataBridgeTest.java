@@ -725,6 +725,70 @@ class DataBridgeTest {
   }
 
   @Test
+  void circuitBreaker_emptyPollsDoNotResetCounter() throws Exception {
+    // Intermittent traffic during a sustained outage: every other poll is
+    // empty. An empty poll must NOT reset the consecutive-failure counter —
+    // otherwise the breaker would never trip and the cursor consumer keeps
+    // accumulating unacked bookkeeping. Threshold 3, every fail-poll fails,
+    // every other poll is empty: the breaker must engage within ~3
+    // fail-polls (6 total polls).
+    Duration cooldown = Duration.ofMillis(80);
+    config =
+        DataBridgeConfig.builder()
+            .producerConfig(new KafkaProducerConfig("broker:9092"))
+            .pollTimeout(Duration.ofMillis(20))
+            .publishTimeout(Duration.ofMillis(50))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .publishFailureThreshold(3)
+            .publishFailureCooldown(cooldown)
+            .defaultPartitions(1)
+            .defaultReplicationFactor((short) 1)
+            .build();
+    stubKafkaHappyPath("src.chan");
+
+    Message m = msg("m-1", "topic-a", Map.of());
+    AtomicInteger pollCount = new AtomicInteger();
+    when(consumerA.poll(any(Duration.class)))
+        .thenAnswer(
+            inv -> {
+              int n = pollCount.incrementAndGet();
+              // Alternate non-empty / empty: 1=msg, 2=empty, 3=msg, 4=empty, ...
+              return (n % 2 == 1) ? List.of(m) : List.of();
+            });
+
+    CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+    failed.completeExceptionally(new RuntimeException("publish-fail"));
+    when(mockPublisher.publish(any(Message.class))).thenReturn(failed);
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataBridge bridge = newBridge(sleeper);
+    bridge.register("src", "chan", "topic-a", consumerA, ChannelOptions.defaults());
+    bridge.start();
+
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      synchronized (sleeper.sleeps) {
+        if (sleeper.sleeps.contains(cooldown)) {
+          break;
+        }
+      }
+      Thread.sleep(10);
+    }
+    bridge.close();
+
+    long cooldownSleeps;
+    synchronized (sleeper.sleeps) {
+      cooldownSleeps = sleeper.sleeps.stream().filter(d -> d.equals(cooldown)).count();
+    }
+    assertTrue(
+        cooldownSleeps >= 1,
+        "breaker should trip despite empty polls interleaved with failures; cooldownSleeps="
+            + cooldownSleeps);
+  }
+
+  @Test
   void circuitBreaker_probeState_tripsAgainAfterSingleFailure() throws Exception {
     // After the first cooldown, the worker enters a probe state: one publish
     // failure (not `threshold` of them) trips the breaker again. With
