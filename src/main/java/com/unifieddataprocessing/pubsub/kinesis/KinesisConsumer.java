@@ -219,7 +219,13 @@ public class KinesisConsumer implements PubSubConsumer {
       shardSeqByMessageId.clear();
       deliveredSeqsByShard.clear();
       ackedSeqsByShard.clear();
-      nextAllowedFetchNanosByShard.clear();
+      // nextAllowedFetchNanosByShard intentionally retained: acquireShardIterator
+      // uses the GetShardIterator API and does not consume the per-shard
+      // GetRecords TPS budget, so the throttle established by the previous
+      // GetRecords call on this shard still applies. Clearing it here would
+      // let the next poll fire GetRecords immediately and trip the
+      // 5-TPS-per-shard limit (ProvisionedThroughputExceededException) under
+      // the exact outage scenario this cap is meant to handle.
       return Collections.emptyList();
     }
     long deadlineNanos = System.nanoTime() + timeout.toNanos();

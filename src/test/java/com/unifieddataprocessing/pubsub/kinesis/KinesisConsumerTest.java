@@ -863,6 +863,68 @@ class KinesisConsumerTest {
   }
 
   @Test
+  void poll_preservesPerShardThrottle_acrossInFlightCapReacquire() {
+    // After the at-cap re-acquire, the next GetRecords call must still
+    // respect the per-shard min-interval established by the previous
+    // GetRecords call. acquireShardIterator uses GetShardIterator (not
+    // GetRecords), so the TPS budget on the shard hasn't replenished;
+    // clearing nextAllowedFetchNanosByShard would let the next poll fire
+    // GetRecords immediately and trip ProvisionedThroughputExceededException
+    // under the exact outage scenario the cap is meant to handle.
+    KinesisConsumerConfig cappedThrottled =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ofMillis(100),
+            Map.of(),
+            2);
+    KinesisConsumer capped = new KinesisConsumer(cappedThrottled, c -> mockClient);
+    capped.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-REACQUIRED").build());
+    Record r1 =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    Record r2 =
+        Record.builder()
+            .sequenceNumber("105")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("b"))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder().records(r1, r2).nextShardIterator("ITER-1").build());
+    capped.subscribe(STREAM);
+
+    long start = System.nanoTime();
+    // Poll #1: GetRecords, fills cap.
+    capped.poll(Duration.ofMillis(500));
+    // Poll #2: at-cap → re-acquire iterator, clear bookkeeping, return empty.
+    capped.poll(Duration.ofMillis(500));
+    // Poll #3: would call GetRecords, but the per-shard throttle from poll #1
+    // must still apply, so this poll must sleep until ~100ms after poll #1.
+    capped.poll(Duration.ofMillis(500));
+    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+    verify(mockClient, times(2)).getRecords(any(GetRecordsRequest.class));
+    assertTrue(
+        elapsedMs >= 90,
+        "Expected ~100ms throttle to survive the at-cap re-acquire, observed " + elapsedMs);
+  }
+
+  @Test
   void poll_throttlesByBytesAfterLargeResponse() {
     // Kinesis caps each shard at 2 MiB/s for GetRecords. After a large
     // response, the byte budget can require a longer wait than the TPS
