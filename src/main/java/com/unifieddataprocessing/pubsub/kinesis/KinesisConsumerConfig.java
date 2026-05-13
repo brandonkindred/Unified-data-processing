@@ -113,9 +113,11 @@ public final class KinesisConsumerConfig {
   /**
    * Full configuration including the in-flight cap. {@code maxInFlightMessages} bounds the number
    * of polled-but-unacked messages: when at-or-above the cap,
-   * {@link KinesisConsumer#poll(Duration)} returns an empty batch without calling Kinesis, so the
-   * per-message and per-shard bookkeeping maps cannot grow without bound during a prolonged
-   * downstream outage. {@code 0} disables the cap.
+   * {@link KinesisConsumer#poll(Duration)} re-acquires each shard iterator at the lowest unacked
+   * sequence, clears its in-memory bookkeeping, and returns empty — the next poll redelivers from
+   * the unacked sequence so the per-message and per-shard maps cannot grow without bound during a
+   * prolonged downstream outage while still allowing the registration to recover once the
+   * publisher comes back. {@code 0} disables the cap.
    */
   public KinesisConsumerConfig(
       String streamName,
@@ -180,8 +182,9 @@ public final class KinesisConsumerConfig {
   }
 
   /**
-   * In-flight cap above which {@link KinesisConsumer#poll(Duration)} short-circuits to an empty
-   * batch. {@code 0} means uncapped.
+   * In-flight cap above which {@link KinesisConsumer#poll(Duration)} re-acquires each shard
+   * iterator at the lowest unacked sequence, clears bookkeeping, and returns empty for that call.
+   * {@code 0} means uncapped.
    */
   public int getMaxInFlightMessages() {
     return maxInFlightMessages;

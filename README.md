@@ -402,8 +402,10 @@ try (DataBridge bridge = new DataBridge(cfg)) {
    accumulate while the downstream stays broken. Independent registrations
    are unaffected. For an additional hard backstop, `KafkaConsumerConfig` /
    `KinesisConsumerConfig` accept a `maxInFlightMessages` cap above which the
-   consumer's own `poll(...)` returns an empty batch without calling the
-   underlying client.
+   consumer seeks the underlying client back to the lowest unacked
+   offset/sequence, clears its in-memory bookkeeping, and returns an empty
+   batch; the next poll redelivers those records so the registration can
+   resume once the publisher recovers.
 
 `register(...)` must be called before `start()`, and `start()` is once-only.
 `close()` is synchronized and idempotent: it shuts down the per-registration

@@ -26,9 +26,12 @@ public final class KafkaConsumerConfig {
 
   /**
    * Full constructor. {@code maxInFlightMessages} bounds the number of polled-but-unacked
-   * messages: when at-or-above the cap, {@link KafkaConsumer#poll(java.time.Duration)} returns an
-   * empty batch without calling the underlying Kafka client, so per-message bookkeeping cannot
-   * grow without bound during a prolonged downstream outage. {@code 0} disables the cap.
+   * messages: when at-or-above the cap, {@link KafkaConsumer#poll(java.time.Duration)} seeks the
+   * underlying client back to the lowest unacked offset on each assigned partition, clears its
+   * in-memory bookkeeping, and returns empty — the next poll redelivers from the unacked offset
+   * so per-message bookkeeping cannot grow without bound during a prolonged downstream outage
+   * while still allowing the registration to recover once the publisher comes back. {@code 0}
+   * disables the cap.
    */
   public KafkaConsumerConfig(
       String bootstrapServers,
@@ -61,8 +64,9 @@ public final class KafkaConsumerConfig {
   }
 
   /**
-   * In-flight cap above which {@link KafkaConsumer#poll(java.time.Duration)} short-circuits to an
-   * empty batch. {@code 0} means uncapped.
+   * In-flight cap above which {@link KafkaConsumer#poll(java.time.Duration)} seeks back to the
+   * lowest unacked offset, clears bookkeeping, and returns empty for that call. {@code 0} means
+   * uncapped.
    */
   public int getMaxInFlightMessages() {
     return maxInFlightMessages;

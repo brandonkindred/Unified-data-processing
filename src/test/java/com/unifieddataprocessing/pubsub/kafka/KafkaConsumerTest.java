@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
@@ -371,7 +372,7 @@ class KafkaConsumerTest {
   }
 
   @Test
-  void poll_returnsEmpty_whenInFlightAtCap_andResumesAfterAck() {
+  void poll_seeksBackAndClearsBookkeeping_whenInFlightAtCap() {
     KafkaConsumerConfig cappedConfig =
         new KafkaConsumerConfig("broker:9092", "test-group", Map.of(), 2);
     KafkaConsumer cappedConsumer =
@@ -384,24 +385,53 @@ class KafkaConsumerTest {
     ConsumerRecord<byte[], byte[]> r11 =
         new ConsumerRecord<>("topic-a", 0, 11L, null, "b".getBytes());
     when(mockKafkaClient.poll(any(Duration.class)))
-        .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r10, r11))));
+        .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r10, r11))))
+        .thenReturn(ConsumerRecords.empty());
+    when(mockKafkaClient.assignment()).thenReturn(Set.of(tp));
 
     // Fill the cap: two records delivered, neither acked.
     List<Message> first = cappedConsumer.poll(Duration.ofMillis(10));
     assertEquals(2, first.size());
 
-    // At-cap: poll() returns empty without touching the underlying client.
+    // At-cap: poll() seeks back to the lowest unacked offset, clears
+    // bookkeeping, and returns empty without calling the underlying poll().
     assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
-    assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
-    // Underlying client was polled exactly once (only the first call).
+    verify(mockKafkaClient).seek(tp, 10L);
     verify(mockKafkaClient, org.mockito.Mockito.times(1)).poll(any(Duration.class));
 
-    // Ack one record so the prefix advances; the next poll() resumes calling
-    // the underlying client.
-    cappedConsumer.acknowledge(first.get(0));
-    when(mockKafkaClient.poll(any(Duration.class))).thenReturn(ConsumerRecords.empty());
+    // Bookkeeping was cleared, so the cleared Message can no longer be acked
+    // (it will be redelivered on the next poll).
+    assertThrows(IllegalStateException.class, () -> cappedConsumer.acknowledge(first.get(0)));
+
+    // Next poll resumes calling the underlying client (cap no longer blocks).
     cappedConsumer.poll(Duration.ofMillis(10));
     verify(mockKafkaClient, org.mockito.Mockito.times(2)).poll(any(Duration.class));
+  }
+
+  @Test
+  void poll_doesNotSeekPartitionsWithoutDeliveredRecords_whenAtCap() {
+    // Only one partition has tracked records; the other is assigned but
+    // empty. seek() must only fire for the partition with bookkeeping.
+    KafkaConsumerConfig cappedConfig =
+        new KafkaConsumerConfig("broker:9092", "test-group", Map.of(), 1);
+    KafkaConsumer cappedConsumer =
+        new KafkaConsumer(cappedConfig, props -> mockKafkaClient);
+    cappedConsumer.connect();
+
+    TopicPartition active = new TopicPartition("topic-a", 0);
+    TopicPartition idle = new TopicPartition("topic-a", 1);
+    ConsumerRecord<byte[], byte[]> r5 =
+        new ConsumerRecord<>("topic-a", 0, 5L, null, "x".getBytes());
+    when(mockKafkaClient.poll(any(Duration.class)))
+        .thenReturn(new ConsumerRecords<>(Map.of(active, List.of(r5))));
+    when(mockKafkaClient.assignment()).thenReturn(Set.of(active, idle));
+
+    cappedConsumer.poll(Duration.ofMillis(10));
+    // Now at cap; second poll should seek active to 5L but not seek idle.
+    cappedConsumer.poll(Duration.ofMillis(10));
+
+    verify(mockKafkaClient).seek(active, 5L);
+    verify(mockKafkaClient, never()).seek(eq(idle), anyLong());
   }
 
   @Test

@@ -1070,7 +1070,7 @@ class KinesisConsumerTest {
   }
 
   @Test
-  void poll_returnsEmpty_whenInFlightAtCap_andResumesAfterAck() {
+  void poll_reacquiresIteratorAndClearsBookkeeping_whenInFlightAtCap() {
     KinesisConsumerConfig cappedConfig =
         new KinesisConsumerConfig(
             STREAM,
@@ -1089,7 +1089,8 @@ class KinesisConsumerTest {
                 .shards(Shard.builder().shardId("shard-0").build())
                 .build());
     when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
-        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build());
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-REACQUIRED").build());
     Record r1 =
         Record.builder()
             .sequenceNumber("100")
@@ -1112,16 +1113,95 @@ class KinesisConsumerTest {
     List<Message> first = cappedConsumer.poll(Duration.ofMillis(10));
     assertEquals(2, first.size());
 
-    // At-cap: poll() returns empty without touching getRecords.
-    assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
+    // At-cap: poll() re-acquires the shard iterator at the lowest unacked
+    // sequence (no watermark yet → AT_SEQUENCE_NUMBER on "100"), clears
+    // bookkeeping, and returns empty without calling getRecords.
     assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
     verify(mockClient, times(1)).getRecords(any(GetRecordsRequest.class));
+    ArgumentCaptor<GetShardIteratorRequest> captor =
+        ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+    verify(mockClient, times(2)).getShardIterator(captor.capture());
+    GetShardIteratorRequest reacquire = captor.getAllValues().get(1);
+    assertEquals(ShardIteratorType.AT_SEQUENCE_NUMBER, reacquire.shardIteratorType());
+    assertEquals("100", reacquire.startingSequenceNumber());
 
-    // Ack the lower sequence so the in-flight count drops below the cap;
-    // the next poll() resumes calling getRecords.
-    cappedConsumer.acknowledge(first.get(0));
+    // Bookkeeping was cleared, so the cleared Message can no longer be acked
+    // (it will be redelivered on the next poll).
+    assertThrows(IllegalStateException.class, () -> cappedConsumer.acknowledge(first.get(0)));
+
+    // Next poll resumes calling getRecords (cap no longer blocks).
     cappedConsumer.poll(Duration.ofMillis(10));
     verify(mockClient, times(2)).getRecords(any(GetRecordsRequest.class));
+  }
+
+  @Test
+  void poll_reacquireAtCap_usesHighWatermarkWhenAvailable() {
+    // When some prefix has been acked before the cap is hit, the re-acquire
+    // should be AFTER_SEQUENCE_NUMBER on the watermark (so already-acked
+    // records are not redelivered).
+    KinesisConsumerConfig cappedConfig =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ZERO,
+            Map.of(),
+            2);
+    KinesisConsumer cappedConsumer = new KinesisConsumer(cappedConfig, c -> mockClient);
+    cappedConsumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build())
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-REACQUIRED").build());
+    Record r100 =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    Record r105 =
+        Record.builder()
+            .sequenceNumber("105")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("b"))
+            .build();
+    Record r110 =
+        Record.builder()
+            .sequenceNumber("110")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("c"))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder()
+                .records(r100, r105, r110)
+                .nextShardIterator("ITER-1")
+                .build());
+    cappedConsumer.subscribe(STREAM);
+
+    // First poll delivers 3 records (cap=2, but the underlying batch is 3 —
+    // we don't drop mid-batch). Ack the lowest so the watermark advances to
+    // "100", then the cap is still tripped (2 unacked remain after ack).
+    List<Message> first = cappedConsumer.poll(Duration.ofMillis(10));
+    assertEquals(3, first.size());
+    cappedConsumer.acknowledge(first.get(0));
+    assertEquals("100", cappedConsumer.getCheckpoints().get("shard-0"));
+
+    // Next poll trips the cap (2 unacked >= 2). Re-acquire should be
+    // AFTER_SEQUENCE_NUMBER on "100" so "100" is not redelivered.
+    assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
+    ArgumentCaptor<GetShardIteratorRequest> captor =
+        ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+    verify(mockClient, times(2)).getShardIterator(captor.capture());
+    GetShardIteratorRequest reacquire = captor.getAllValues().get(1);
+    assertEquals(ShardIteratorType.AFTER_SEQUENCE_NUMBER, reacquire.shardIteratorType());
+    assertEquals("100", reacquire.startingSequenceNumber());
   }
 
   /**

@@ -191,14 +191,35 @@ public class KinesisConsumer implements PubSubConsumer {
       return Collections.emptyList();
     }
     // Defense-in-depth: when the caller has accumulated more polled-but-unacked
-    // messages than the configured cap, return empty without spending any
-    // GetRecords / shard budget. Without this, a sustained downstream outage
-    // in DataBridge would grow shardSeqByMessageId / deliveredSeqsByShard /
-    // ackedSeqsByShard without bound on every poll, since the contiguous
-    // prefix can't advance while an early sequence is unacked. cap == 0
-    // disables.
+    // messages than the configured cap, re-acquire each shard iterator at the
+    // lowest unacked sequence (highest acked, else lowest delivered, else the
+    // configured starting position — see resumePositionFor) and clear
+    // in-memory bookkeeping. The next poll redelivers from the unacked
+    // sequence, so the bridge gets fresh copies of records it previously
+    // failed to publish and can drive the watermark forward once the
+    // publisher recovers. Without this re-acquire, the prior iterators have
+    // already advanced past the unacked sequences, the bridge has discarded
+    // the failed batch, and the registration would stall forever at the cap.
+    // cap == 0 disables.
     int cap = config.getMaxInFlightMessages();
     if (cap > 0 && shardSeqByMessageId.size() >= cap) {
+      // Pre-compute resume positions and acquire iterators into a local map
+      // before mutating consumer state, mirroring subscribe()'s
+      // all-or-nothing semantics: if acquireShardIterator throws (transient
+      // AWS error) we leave bookkeeping intact so a future poll can retry.
+      Map<String, KinesisStartingPosition> resumeByShard = new LinkedHashMap<>();
+      for (String shardId : iteratorByShard.keySet()) {
+        resumeByShard.put(shardId, resumePositionFor(shardId));
+      }
+      Map<String, String> newIterators = new LinkedHashMap<>();
+      for (Map.Entry<String, KinesisStartingPosition> entry : resumeByShard.entrySet()) {
+        newIterators.put(entry.getKey(), acquireShardIterator(entry.getKey(), entry.getValue()));
+      }
+      iteratorByShard.putAll(newIterators);
+      shardSeqByMessageId.clear();
+      deliveredSeqsByShard.clear();
+      ackedSeqsByShard.clear();
+      nextAllowedFetchNanosByShard.clear();
       return Collections.emptyList();
     }
     long deadlineNanos = System.nanoTime() + timeout.toNanos();

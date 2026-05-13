@@ -101,13 +101,27 @@ public class KafkaConsumer implements PubSubConsumer {
     Objects.requireNonNull(timeout, "timeout");
     ensureConnected();
     // Defense-in-depth: when the caller has accumulated more polled-but-unacked
-    // messages than the configured cap, refuse to call the underlying client
-    // until acks drain the prefix. Without this, a sustained downstream outage
-    // in DataBridge (which keeps polling without acking on break-batch) would
-    // grow these maps unboundedly. The bridge's circuit-breaker is the primary
-    // mitigation; this is a hard backstop. cap == 0 disables.
+    // messages than the configured cap, seek every assigned partition back to
+    // its lowest unacked offset and clear in-memory bookkeeping, then return
+    // empty for this poll. The next poll redelivers from the unacked offset,
+    // so the bridge gets fresh copies of records it previously failed to
+    // publish and can drive the prefix forward once the publisher recovers.
+    // Without this seek-back, the underlying client's position has already
+    // advanced past the unacked records, the bridge has discarded the failed
+    // batch, and the registration would stall forever at the cap.
+    // cap == 0 disables.
     int cap = config.getMaxInFlightMessages();
     if (cap > 0 && partitionByMessageId.size() >= cap) {
+      for (TopicPartition tp : consumer.assignment()) {
+        NavigableSet<Long> delivered = deliveredOffsetsByPartition.get(tp);
+        if (delivered != null && !delivered.isEmpty()) {
+          consumer.seek(tp, delivered.first());
+        }
+      }
+      partitionByMessageId.clear();
+      offsetByMessageId.clear();
+      deliveredOffsetsByPartition.clear();
+      ackedOffsetsByPartition.clear();
       return Collections.emptyList();
     }
     ConsumerRecords<byte[], byte[]> records = consumer.poll(timeout);
