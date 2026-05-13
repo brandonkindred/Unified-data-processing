@@ -13,7 +13,6 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
@@ -237,61 +236,51 @@ public final class DataRelay implements AutoCloseable {
    * (the {@code CompletableFuture} a timed-out {@code .get()} left outstanding in
    * {@link #publishWithRetry}) cannot bypass the relay's declared shutdown budget.
    *
-   * <p>Each flush runs on a single-thread daemon executor and is awaited with the remaining slice
-   * of the budget; if the slice expires the call is cancelled (best-effort interrupt) and the next
-   * publisher is attempted. The flush executor is force-shut at the end so its worker thread does
-   * not leak past {@code close()}.
+   * <p>The budget is split into equal {@code closeForceTimeout / registrations.size()} per-flush
+   * slices (with a 1 ms floor) and each flush runs on its own short-lived daemon thread, so a
+   * flush that hangs and ignores interruption on one publisher consumes only its own slice and
+   * cannot starve later publishers of their fair share. If a slice expires the thread is
+   * interrupted (best-effort) and abandoned — abandoned threads are daemons, so they don't keep
+   * the JVM alive past {@code close()}.
    */
   private void flushPublishersBounded() {
     if (registrations.isEmpty()) {
       return;
     }
-    ExecutorService flushExec =
-        Executors.newSingleThreadExecutor(
-            r -> {
-              Thread t = new Thread(r, "data-relay-flush");
-              t.setDaemon(true);
-              return t;
-            });
-    try {
-      long deadlineNs = System.nanoTime() + config.closeForceTimeout().toNanos();
-      for (RelayRegistration reg : registrations) {
-        long remainingNs = deadlineNs - System.nanoTime();
-        if (remainingNs <= 0) {
-          LOG.log(
-              Level.WARNING,
-              "flush budget exhausted; skipping remaining publisher flushes during close()");
-          break;
-        }
-        Future<?> f =
-            flushExec.submit(
-                () -> {
-                  try {
-                    reg.publisher().flush();
-                  } catch (RuntimeException ignored) {
-                    // best-effort
-                  }
-                });
-        try {
-          f.get(remainingNs, TimeUnit.NANOSECONDS);
-        } catch (TimeoutException te) {
-          f.cancel(true);
-          LOG.log(
-              Level.WARNING,
-              "flush timed out for "
-                  + reg.destinationId()
-                  + "/"
-                  + reg.downstreamTopic()
-                  + "; abandoning and continuing close()");
-        } catch (InterruptedException ie) {
-          Thread.currentThread().interrupt();
-          break;
-        } catch (ExecutionException ignored) {
-          // best-effort
-        }
+    long perFlushNs =
+        Math.max(1_000_000L, config.closeForceTimeout().toNanos() / registrations.size());
+    long joinMs = TimeUnit.NANOSECONDS.toMillis(perFlushNs);
+    int joinNs = (int) (perFlushNs % 1_000_000L);
+    for (RelayRegistration reg : registrations) {
+      Thread flushThread =
+          new Thread(
+              () -> {
+                try {
+                  reg.publisher().flush();
+                } catch (RuntimeException ignored) {
+                  // best-effort
+                }
+              },
+              "data-relay-flush-" + reg.destinationId());
+      flushThread.setDaemon(true);
+      flushThread.start();
+      try {
+        flushThread.join(joinMs, joinNs);
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        flushThread.interrupt();
+        break;
       }
-    } finally {
-      flushExec.shutdownNow();
+      if (flushThread.isAlive()) {
+        flushThread.interrupt();
+        LOG.log(
+            Level.WARNING,
+            "flush timed out for "
+                + reg.destinationId()
+                + "/"
+                + reg.downstreamTopic()
+                + "; abandoning and continuing close()");
+      }
     }
   }
 

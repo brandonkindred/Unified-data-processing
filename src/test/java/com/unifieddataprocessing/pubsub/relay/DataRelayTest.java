@@ -646,6 +646,62 @@ class DataRelayTest {
   }
 
   @Test
+  void close_stuckFlushOnA_doesNotBlockFlushOnB() throws Exception {
+    // publisherA.flush() hangs (and would ignore Thread.interrupt() — the latch only releases
+    // when the test releases it). publisherB.flush() must still get a fair shot at the remaining
+    // budget despite A holding onto its own flush thread.
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+    lenient().when(consumerB.poll(any(Duration.class))).thenReturn(List.of());
+
+    CountDownLatch flushReleaser = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              // Loop on a non-interruptible await so a Thread.interrupt() is genuinely ignored,
+              // mirroring publishers (GCP/Kinesis) whose flush() doesn't honor interruption.
+              while (!flushReleaser.await(50, TimeUnit.MILLISECONDS)) {
+                // swallow any interrupt status and keep waiting
+                Thread.interrupted();
+              }
+              return null;
+            })
+        .when(publisherA)
+        .flush();
+
+    CountDownLatch flushedB = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              flushedB.countDown();
+              return null;
+            })
+        .when(publisherB)
+        .flush();
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+    relay.start();
+
+    long t0 = System.nanoTime();
+    relay.close();
+    long elapsedNs = System.nanoTime() - t0;
+    flushReleaser.countDown(); // release the hung flush so the daemon thread can finish
+
+    // Worst case budget: shutdownTimeout + closeForceTimeout + grace.
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofMillis(500));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() took " + Duration.ofNanos(elapsedNs) + " but budget is " + budget);
+
+    // Despite publisherA's flush() ignoring interruption, publisherB.flush() was reached and ran.
+    assertTrue(
+        flushedB.await(1, TimeUnit.SECONDS),
+        "publisherB.flush() should have run despite publisherA.flush() hanging");
+    verify(publisherA).close();
+    verify(publisherB).close();
+  }
+
+  @Test
   void close_calledTwice_isNoOp() {
     lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
 
