@@ -13,6 +13,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
@@ -189,13 +190,7 @@ public final class DataRelay implements AutoCloseable {
       }
     }
 
-    for (RelayRegistration reg : registrations) {
-      try {
-        reg.publisher().flush();
-      } catch (RuntimeException ignored) {
-        // best-effort
-      }
-    }
+    flushPublishersBounded();
     for (RelayRegistration reg : registrations) {
       try {
         reg.consumer().close();
@@ -234,6 +229,70 @@ public final class DataRelay implements AutoCloseable {
       }
     }
     state = State.Closed;
+  }
+
+  /**
+   * Flushes every registered publisher with a total wall-time budget of {@code closeForceTimeout},
+   * so a publisher whose {@code flush()} would block forever on a stale in-flight publish future
+   * (the {@code CompletableFuture} a timed-out {@code .get()} left outstanding in
+   * {@link #publishWithRetry}) cannot bypass the relay's declared shutdown budget.
+   *
+   * <p>Each flush runs on a single-thread daemon executor and is awaited with the remaining slice
+   * of the budget; if the slice expires the call is cancelled (best-effort interrupt) and the next
+   * publisher is attempted. The flush executor is force-shut at the end so its worker thread does
+   * not leak past {@code close()}.
+   */
+  private void flushPublishersBounded() {
+    if (registrations.isEmpty()) {
+      return;
+    }
+    ExecutorService flushExec =
+        Executors.newSingleThreadExecutor(
+            r -> {
+              Thread t = new Thread(r, "data-relay-flush");
+              t.setDaemon(true);
+              return t;
+            });
+    try {
+      long deadlineNs = System.nanoTime() + config.closeForceTimeout().toNanos();
+      for (RelayRegistration reg : registrations) {
+        long remainingNs = deadlineNs - System.nanoTime();
+        if (remainingNs <= 0) {
+          LOG.log(
+              Level.WARNING,
+              "flush budget exhausted; skipping remaining publisher flushes during close()");
+          break;
+        }
+        Future<?> f =
+            flushExec.submit(
+                () -> {
+                  try {
+                    reg.publisher().flush();
+                  } catch (RuntimeException ignored) {
+                    // best-effort
+                  }
+                });
+        try {
+          f.get(remainingNs, TimeUnit.NANOSECONDS);
+        } catch (TimeoutException te) {
+          f.cancel(true);
+          LOG.log(
+              Level.WARNING,
+              "flush timed out for "
+                  + reg.destinationId()
+                  + "/"
+                  + reg.downstreamTopic()
+                  + "; abandoning and continuing close()");
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          break;
+        } catch (ExecutionException ignored) {
+          // best-effort
+        }
+      }
+    } finally {
+      flushExec.shutdownNow();
+    }
   }
 
   private void pollLoopForever(RelayRegistration reg) {

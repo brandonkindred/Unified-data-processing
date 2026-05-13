@@ -83,8 +83,11 @@ public final class DataRelayConfig {
     }
 
     /**
-     * Extra wait after {@code shutdownNow()} for poll threads to fully stop touching the
-     * publishers/consumers. Must be strictly positive.
+     * Hard upper bound on close-time waits. Used both for the extra wait after
+     * {@code shutdownNow()} for poll threads to fully stop touching the publishers/consumers, and
+     * as the total wall-time budget for the post-executor publisher-flush phase (so a publisher
+     * whose {@code flush()} would block forever on a stale in-flight future cannot bypass the
+     * relay's shutdown budget). Must be strictly positive.
      */
     public Builder closeForceTimeout(Duration closeForceTimeout) {
       this.closeForceTimeout = requirePositive("closeForceTimeout", closeForceTimeout);

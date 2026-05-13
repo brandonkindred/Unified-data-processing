@@ -517,7 +517,10 @@ try (DataRelay relay = new DataRelay(cfg)) {
 `register(...)` must be called before `start()`, and `start()` is once-only.
 `close()` is synchronized and idempotent: it shuts down the per-registration
 executor (graceful `shutdownTimeout` then forced `closeForceTimeout`), flushes
-every publisher, then closes every consumer and every publisher.
+every publisher under a total wall-time budget of `closeForceTimeout` (so a
+publisher whose `flush()` would block forever on a stale in-flight future
+cannot bypass the shutdown budget), then closes every consumer and every
+publisher.
 
 ## Building from source
 

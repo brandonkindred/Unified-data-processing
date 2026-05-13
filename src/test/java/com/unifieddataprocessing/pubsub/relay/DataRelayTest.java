@@ -605,6 +605,47 @@ class DataRelayTest {
   }
 
   @Test
+  void close_boundsFlushPhaseAgainstCloseForceTimeout() throws Exception {
+    // publisherA.flush() blocks forever (latch never decremented); close() must still return
+    // within the relay's declared budget instead of stalling on the publisher.
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+    lenient().when(consumerB.poll(any(Duration.class))).thenReturn(List.of());
+
+    CountDownLatch flushReleaser = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              flushReleaser.await(60, TimeUnit.SECONDS);
+              return null;
+            })
+        .when(publisherA)
+        .flush();
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+    relay.start();
+
+    long t0 = System.nanoTime();
+    relay.close();
+    long elapsedNs = System.nanoTime() - t0;
+    flushReleaser.countDown(); // release the hung flush so the daemon thread can finish
+
+    // Worst case: shutdownTimeout (executor graceful) + closeForceTimeout (flush phase) + grace.
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofMillis(500));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() took " + Duration.ofNanos(elapsedNs) + " but budget is " + budget);
+
+    // close() on publishers and consumers is still attempted (best-effort), even after the
+    // hanging flush is abandoned.
+    verify(publisherA).close();
+    verify(publisherB).close();
+    verify(consumerA).close();
+    verify(consumerB).close();
+  }
+
+  @Test
   void close_calledTwice_isNoOp() {
     lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
 
