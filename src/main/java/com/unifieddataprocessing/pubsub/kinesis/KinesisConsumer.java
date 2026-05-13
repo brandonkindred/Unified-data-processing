@@ -190,6 +190,17 @@ public class KinesisConsumer implements PubSubConsumer {
     if (iteratorByShard.isEmpty()) {
       return Collections.emptyList();
     }
+    // Defense-in-depth: when the caller has accumulated more polled-but-unacked
+    // messages than the configured cap, return empty without spending any
+    // GetRecords / shard budget. Without this, a sustained downstream outage
+    // in DataBridge would grow shardSeqByMessageId / deliveredSeqsByShard /
+    // ackedSeqsByShard without bound on every poll, since the contiguous
+    // prefix can't advance while an early sequence is unacked. cap == 0
+    // disables.
+    int cap = config.getMaxInFlightMessages();
+    if (cap > 0 && shardSeqByMessageId.size() >= cap) {
+      return Collections.emptyList();
+    }
     long deadlineNanos = System.nanoTime() + timeout.toNanos();
     List<Message> result = new ArrayList<>();
     // Visit shards by ascending nextAllowedFetchNanos so ready shards run

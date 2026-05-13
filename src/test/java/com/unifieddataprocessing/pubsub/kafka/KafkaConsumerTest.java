@@ -371,6 +371,57 @@ class KafkaConsumerTest {
   }
 
   @Test
+  void poll_returnsEmpty_whenInFlightAtCap_andResumesAfterAck() {
+    KafkaConsumerConfig cappedConfig =
+        new KafkaConsumerConfig("broker:9092", "test-group", Map.of(), 2);
+    KafkaConsumer cappedConsumer =
+        new KafkaConsumer(cappedConfig, props -> mockKafkaClient);
+    cappedConsumer.connect();
+
+    TopicPartition tp = new TopicPartition("topic-a", 0);
+    ConsumerRecord<byte[], byte[]> r10 =
+        new ConsumerRecord<>("topic-a", 0, 10L, null, "a".getBytes());
+    ConsumerRecord<byte[], byte[]> r11 =
+        new ConsumerRecord<>("topic-a", 0, 11L, null, "b".getBytes());
+    when(mockKafkaClient.poll(any(Duration.class)))
+        .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r10, r11))));
+
+    // Fill the cap: two records delivered, neither acked.
+    List<Message> first = cappedConsumer.poll(Duration.ofMillis(10));
+    assertEquals(2, first.size());
+
+    // At-cap: poll() returns empty without touching the underlying client.
+    assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
+    assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
+    // Underlying client was polled exactly once (only the first call).
+    verify(mockKafkaClient, org.mockito.Mockito.times(1)).poll(any(Duration.class));
+
+    // Ack one record so the prefix advances; the next poll() resumes calling
+    // the underlying client.
+    cappedConsumer.acknowledge(first.get(0));
+    when(mockKafkaClient.poll(any(Duration.class))).thenReturn(ConsumerRecords.empty());
+    cappedConsumer.poll(Duration.ofMillis(10));
+    verify(mockKafkaClient, org.mockito.Mockito.times(2)).poll(any(Duration.class));
+  }
+
+  @Test
+  void poll_uncapped_doesNotShortCircuit() {
+    // Default config has maxInFlightMessages = 0 → no cap; poll() always
+    // delegates to the underlying client even when many records are in flight.
+    consumer.connect();
+    TopicPartition tp = new TopicPartition("topic-a", 0);
+    ConsumerRecord<byte[], byte[]> r10 =
+        new ConsumerRecord<>("topic-a", 0, 10L, null, "x".getBytes());
+    when(mockKafkaClient.poll(any(Duration.class)))
+        .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r10))))
+        .thenReturn(ConsumerRecords.empty());
+
+    consumer.poll(Duration.ofMillis(10));
+    consumer.poll(Duration.ofMillis(10));
+    verify(mockKafkaClient, org.mockito.Mockito.times(2)).poll(any(Duration.class));
+  }
+
+  @Test
   void acknowledge_inOrderCommitsAfterEachAck() {
     consumer.connect();
     TopicPartition tp = new TopicPartition("topic-a", 0);

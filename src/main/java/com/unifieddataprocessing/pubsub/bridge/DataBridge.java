@@ -40,9 +40,15 @@ import org.apache.kafka.clients.admin.AdminClient;
  * N worker threads and relies on the underlying Kafka client being thread-safe for {@code send}.
  * A failing {@code poll(...)} backs off via the injected {@link Sleeper} and retries; a failing
  * {@code publish(...)} (timeout or execution failure) breaks the current batch without acking, so
- * the source will redeliver. Per-channel {@link ChannelOptions} layered over the
- * {@link DataBridgeConfig} defaults control each topic's partitions, replication factor, and Kafka
- * topic-configs at provision time.
+ * the source will redeliver. To bound in-memory bookkeeping growth on cursor-based sources (e.g.
+ * {@code KafkaConsumer}, {@code KinesisConsumer}) during a sustained downstream outage, each
+ * worker tracks consecutive publish failures per registration: once
+ * {@link DataBridgeConfig#publishFailureThreshold()} is reached the worker sleeps for
+ * {@link DataBridgeConfig#publishFailureCooldown()} before its next poll and resets the counter,
+ * so polling pauses while the downstream stays broken and resumes automatically when it recovers.
+ * A single successful publish resets the counter. Per-channel {@link ChannelOptions} layered over
+ * the {@link DataBridgeConfig} defaults control each topic's partitions, replication factor, and
+ * Kafka topic-configs at provision time.
  */
 public final class DataBridge implements AutoCloseable {
 
@@ -53,6 +59,16 @@ public final class DataBridge implements AutoCloseable {
     Provisioning,
     Running,
     Closed
+  }
+
+  /** Outcome of a single {@code processBatch(...)} call as observed by {@link #pollLoopForever}. */
+  private enum BatchOutcome {
+    /** Every message in the batch was published and acked, or the batch was empty. */
+    Ok,
+    /** A publish timed out or failed; the batch was broken without acking. */
+    PublishFailed,
+    /** Worker thread was interrupted (e.g. shutdown); the worker must exit. */
+    Interrupted
   }
 
   private final DataBridgeConfig config;
@@ -258,6 +274,7 @@ public final class DataBridge implements AutoCloseable {
   }
 
   private void pollLoopForever(Registration reg, PubSubPublisher pub) {
+    int consecutivePublishFailures = 0;
     while (state == State.Running) {
       List<Message> batch;
       try {
@@ -272,33 +289,55 @@ public final class DataBridge implements AutoCloseable {
         }
         continue;
       }
-      if (!processBatch(reg, pub, batch)) {
+      BatchOutcome outcome = processBatch(reg, pub, batch);
+      if (outcome == BatchOutcome.Interrupted) {
         return;
+      }
+      if (outcome == BatchOutcome.PublishFailed) {
+        consecutivePublishFailures++;
+        if (consecutivePublishFailures >= config.publishFailureThreshold()) {
+          LOG.log(
+              Level.WARNING,
+              "circuit-breaker engaged for {0} after {1} consecutive publish failures; "
+                  + "pausing polling for {2}",
+              new Object[] {
+                reg.targetTopic(), consecutivePublishFailures, config.publishFailureCooldown()
+              });
+          try {
+            sleeper.sleep(config.publishFailureCooldown());
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return;
+          }
+          consecutivePublishFailures = 0;
+        }
+      } else {
+        consecutivePublishFailures = 0;
       }
     }
   }
 
-  private boolean processBatch(Registration reg, PubSubPublisher pub, List<Message> batch) {
+  private BatchOutcome processBatch(Registration reg, PubSubPublisher pub, List<Message> batch) {
     for (Message m : batch) {
       if (state != State.Running) {
-        return true;
+        return BatchOutcome.Ok;
       }
       Message rewritten = MessageRewriter.rewrite(m, reg);
       try {
         pub.publish(rewritten).get(config.publishTimeout().toMillis(), TimeUnit.MILLISECONDS);
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
-        return false;
+        return BatchOutcome.Interrupted;
       } catch (ExecutionException | TimeoutException e) {
         LOG.log(
             Level.WARNING,
             "publish failed for " + reg.targetTopic() + "; breaking batch (no ack)",
             e);
-        return true;
+        return BatchOutcome.PublishFailed;
       }
       reg.consumer().acknowledge(m);
     }
-    return true;
+    return BatchOutcome.Ok;
   }
 
   private static boolean awaitQuietly(ExecutorService exec, long millis) {

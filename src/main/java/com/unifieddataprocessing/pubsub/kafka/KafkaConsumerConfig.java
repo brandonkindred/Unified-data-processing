@@ -13,19 +13,39 @@ public final class KafkaConsumerConfig {
   private final String bootstrapServers;
   private final String groupId;
   private final Map<String, Object> extras;
+  private final int maxInFlightMessages;
 
   public KafkaConsumerConfig(String bootstrapServers, String groupId) {
-    this(bootstrapServers, groupId, Collections.emptyMap());
+    this(bootstrapServers, groupId, Collections.emptyMap(), 0);
   }
 
   /** Creates a config with extra Kafka client properties merged in (extras may be null). */
   public KafkaConsumerConfig(String bootstrapServers, String groupId, Map<String, Object> extras) {
+    this(bootstrapServers, groupId, extras, 0);
+  }
+
+  /**
+   * Full constructor. {@code maxInFlightMessages} bounds the number of polled-but-unacked
+   * messages: when at-or-above the cap, {@link KafkaConsumer#poll(java.time.Duration)} returns an
+   * empty batch without calling the underlying Kafka client, so per-message bookkeeping cannot
+   * grow without bound during a prolonged downstream outage. {@code 0} disables the cap.
+   */
+  public KafkaConsumerConfig(
+      String bootstrapServers,
+      String groupId,
+      Map<String, Object> extras,
+      int maxInFlightMessages) {
     this.bootstrapServers = Objects.requireNonNull(bootstrapServers, "bootstrapServers");
     this.groupId = Objects.requireNonNull(groupId, "groupId");
     this.extras =
         extras == null
             ? Collections.emptyMap()
             : Collections.unmodifiableMap(new LinkedHashMap<>(extras));
+    if (maxInFlightMessages < 0) {
+      throw new IllegalArgumentException(
+          "maxInFlightMessages must be >= 0, got " + maxInFlightMessages);
+    }
+    this.maxInFlightMessages = maxInFlightMessages;
   }
 
   public String getBootstrapServers() {
@@ -38,6 +58,14 @@ public final class KafkaConsumerConfig {
 
   public Map<String, Object> getExtras() {
     return extras;
+  }
+
+  /**
+   * In-flight cap above which {@link KafkaConsumer#poll(java.time.Duration)} short-circuits to an
+   * empty batch. {@code 0} means uncapped.
+   */
+  public int getMaxInFlightMessages() {
+    return maxInFlightMessages;
   }
 
   /** Converts this config to a Kafka client {@link Properties} bag. */

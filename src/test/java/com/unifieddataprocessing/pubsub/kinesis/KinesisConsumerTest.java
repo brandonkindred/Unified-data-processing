@@ -1069,6 +1069,61 @@ class KinesisConsumerTest {
     verify(mockClient, times(1)).getRecords(any(GetRecordsRequest.class));
   }
 
+  @Test
+  void poll_returnsEmpty_whenInFlightAtCap_andResumesAfterAck() {
+    KinesisConsumerConfig cappedConfig =
+        new KinesisConsumerConfig(
+            STREAM,
+            Region.US_EAST_1,
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("ak", "sk")),
+            KinesisStartingPosition.trimHorizon(),
+            100,
+            Duration.ZERO,
+            Map.of(),
+            2);
+    KinesisConsumer cappedConsumer = new KinesisConsumer(cappedConfig, c -> mockClient);
+    cappedConsumer.connect();
+    when(mockClient.listShards(any(ListShardsRequest.class)))
+        .thenReturn(
+            ListShardsResponse.builder()
+                .shards(Shard.builder().shardId("shard-0").build())
+                .build());
+    when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+        .thenReturn(GetShardIteratorResponse.builder().shardIterator("ITER-0").build());
+    Record r1 =
+        Record.builder()
+            .sequenceNumber("100")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("a"))
+            .build();
+    Record r2 =
+        Record.builder()
+            .sequenceNumber("105")
+            .partitionKey("pk")
+            .data(SdkBytes.fromUtf8String("b"))
+            .build();
+    when(mockClient.getRecords(any(GetRecordsRequest.class)))
+        .thenReturn(
+            GetRecordsResponse.builder().records(r1, r2).nextShardIterator("ITER-1").build())
+        .thenReturn(GetRecordsResponse.builder().nextShardIterator("ITER-2").build());
+    cappedConsumer.subscribe(STREAM);
+
+    // Fill the cap: two records delivered, neither acked.
+    List<Message> first = cappedConsumer.poll(Duration.ofMillis(10));
+    assertEquals(2, first.size());
+
+    // At-cap: poll() returns empty without touching getRecords.
+    assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
+    assertTrue(cappedConsumer.poll(Duration.ofMillis(10)).isEmpty());
+    verify(mockClient, times(1)).getRecords(any(GetRecordsRequest.class));
+
+    // Ack the lower sequence so the in-flight count drops below the cap;
+    // the next poll() resumes calling getRecords.
+    cappedConsumer.acknowledge(first.get(0));
+    cappedConsumer.poll(Duration.ofMillis(10));
+    verify(mockClient, times(2)).getRecords(any(GetRecordsRequest.class));
+  }
+
   /**
    * Stubs ListShards/GetShardIterator/GetRecords so a single subscribe+poll yields two records on
    * the named shard with the given sequence numbers.

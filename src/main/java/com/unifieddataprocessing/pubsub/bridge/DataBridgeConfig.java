@@ -20,6 +20,8 @@ public final class DataBridgeConfig {
   private final Duration shutdownTimeout;
   private final Duration closeForceTimeout;
   private final Duration pollBackoff;
+  private final int publishFailureThreshold;
+  private final Duration publishFailureCooldown;
   private final int defaultPartitions;
   private final short defaultReplicationFactor;
 
@@ -30,6 +32,8 @@ public final class DataBridgeConfig {
     this.shutdownTimeout = b.shutdownTimeout;
     this.closeForceTimeout = b.closeForceTimeout;
     this.pollBackoff = b.pollBackoff;
+    this.publishFailureThreshold = b.publishFailureThreshold;
+    this.publishFailureCooldown = b.publishFailureCooldown;
     this.defaultPartitions = b.defaultPartitions;
     this.defaultReplicationFactor = b.defaultReplicationFactor;
   }
@@ -62,6 +66,24 @@ public final class DataBridgeConfig {
     return pollBackoff;
   }
 
+  /**
+   * Number of consecutive {@code publish(...)} failures on a single registration before the
+   * bridge's per-registration circuit-breaker engages and pauses polling for
+   * {@link #publishFailureCooldown()}. A successful publish resets the counter.
+   */
+  public int publishFailureThreshold() {
+    return publishFailureThreshold;
+  }
+
+  /**
+   * Sleep applied to the failing registration's worker once the circuit-breaker engages, before
+   * the next {@code poll(...)} is attempted. Bounds the in-memory bookkeeping growth on
+   * cursor-based sources during sustained downstream outages.
+   */
+  public Duration publishFailureCooldown() {
+    return publishFailureCooldown;
+  }
+
   public int defaultPartitions() {
     return defaultPartitions;
   }
@@ -79,6 +101,8 @@ public final class DataBridgeConfig {
     private Duration shutdownTimeout = Duration.ofSeconds(30);
     private Duration closeForceTimeout = Duration.ofSeconds(5);
     private Duration pollBackoff = Duration.ofSeconds(1);
+    private int publishFailureThreshold = 5;
+    private Duration publishFailureCooldown = Duration.ofSeconds(30);
     private int defaultPartitions = 1;
     private short defaultReplicationFactor = 1;
 
@@ -120,6 +144,29 @@ public final class DataBridgeConfig {
     /** Backoff applied after a {@code poll()} failure before the next attempt. Must be > 0. */
     public Builder pollBackoff(Duration pollBackoff) {
       this.pollBackoff = requirePositive("pollBackoff", pollBackoff);
+      return this;
+    }
+
+    /**
+     * Number of consecutive {@code publish(...)} failures on a single registration that engages
+     * the bridge's circuit-breaker. Must be > 0.
+     */
+    public Builder publishFailureThreshold(int publishFailureThreshold) {
+      if (publishFailureThreshold <= 0) {
+        throw new IllegalArgumentException(
+            "publishFailureThreshold must be > 0, got " + publishFailureThreshold);
+      }
+      this.publishFailureThreshold = publishFailureThreshold;
+      return this;
+    }
+
+    /**
+     * Sleep applied to the failing registration's worker once the circuit-breaker engages, before
+     * the next poll. Must be > 0.
+     */
+    public Builder publishFailureCooldown(Duration publishFailureCooldown) {
+      this.publishFailureCooldown =
+          requirePositive("publishFailureCooldown", publishFailureCooldown);
       return this;
     }
 

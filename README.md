@@ -394,6 +394,16 @@ try (DataBridge bridge = new DataBridge(cfg)) {
 6. **Single consumer instance per registration.** Registering the same
    `PubSubConsumer` instance twice is rejected at `register()` time
    (identity check). Build one consumer per registration.
+7. **Per-registration publish circuit-breaker.** When `publish(...)` fails
+   `publishFailureThreshold` times in a row for one registration, that
+   registration's worker sleeps for `publishFailureCooldown` before its next
+   poll (a successful publish resets the counter). This bounds the in-memory
+   bookkeeping that cursor-based sources (`KafkaConsumer`, `KinesisConsumer`)
+   accumulate while the downstream stays broken. Independent registrations
+   are unaffected. For an additional hard backstop, `KafkaConsumerConfig` /
+   `KinesisConsumerConfig` accept a `maxInFlightMessages` cap above which the
+   consumer's own `poll(...)` returns an empty batch without calling the
+   underlying client.
 
 `register(...)` must be called before `start()`, and `start()` is once-only.
 `close()` is synchronized and idempotent: it shuts down the per-registration
@@ -471,9 +481,6 @@ src/main/java/com/unifieddataprocessing/pubsub/
 
 Near-term follow-ups tracked in the issue tracker:
 
-- Cap unacked-message bookkeeping in `DataBridge` during prolonged publish
-  outages so cursor-based sources (e.g. `KafkaConsumer`) don't grow unbounded
-  in-memory state.
 - KCL-based Kinesis consumer for production resharding / lease management.
 - Kafka → external publisher relay (the downstream half of the bridge).
 

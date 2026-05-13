@@ -100,6 +100,16 @@ public class KafkaConsumer implements PubSubConsumer {
   public List<Message> poll(Duration timeout) {
     Objects.requireNonNull(timeout, "timeout");
     ensureConnected();
+    // Defense-in-depth: when the caller has accumulated more polled-but-unacked
+    // messages than the configured cap, refuse to call the underlying client
+    // until acks drain the prefix. Without this, a sustained downstream outage
+    // in DataBridge (which keeps polling without acking on break-batch) would
+    // grow these maps unboundedly. The bridge's circuit-breaker is the primary
+    // mitigation; this is a hard backstop. cap == 0 disables.
+    int cap = config.getMaxInFlightMessages();
+    if (cap > 0 && partitionByMessageId.size() >= cap) {
+      return Collections.emptyList();
+    }
     ConsumerRecords<byte[], byte[]> records = consumer.poll(timeout);
     if (records.isEmpty()) {
       return Collections.emptyList();

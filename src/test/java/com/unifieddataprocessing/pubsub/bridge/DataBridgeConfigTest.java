@@ -22,6 +22,8 @@ class DataBridgeConfigTest {
     assertEquals(Duration.ofSeconds(30), cfg.shutdownTimeout());
     assertEquals(Duration.ofSeconds(5), cfg.closeForceTimeout());
     assertEquals(Duration.ofSeconds(1), cfg.pollBackoff());
+    assertEquals(5, cfg.publishFailureThreshold());
+    assertEquals(Duration.ofSeconds(30), cfg.publishFailureCooldown());
     assertEquals(1, cfg.defaultPartitions());
     assertEquals((short) 1, cfg.defaultReplicationFactor());
   }
@@ -136,6 +138,41 @@ class DataBridgeConfigTest {
   }
 
   @Test
+  void publishFailureThreshold_zero_throws() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> DataBridgeConfig.builder().publishFailureThreshold(0));
+  }
+
+  @Test
+  void publishFailureThreshold_negative_throws() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> DataBridgeConfig.builder().publishFailureThreshold(-1));
+  }
+
+  @Test
+  void publishFailureCooldown_null_throws() {
+    assertThrows(
+        NullPointerException.class,
+        () -> DataBridgeConfig.builder().publishFailureCooldown(null));
+  }
+
+  @Test
+  void publishFailureCooldown_zero_throws() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> DataBridgeConfig.builder().publishFailureCooldown(Duration.ZERO));
+  }
+
+  @Test
+  void publishFailureCooldown_negative_throws() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> DataBridgeConfig.builder().publishFailureCooldown(Duration.ofMillis(-1)));
+  }
+
+  @Test
   void defaultPartitions_zero_throws() {
     assertThrows(
         IllegalArgumentException.class, () -> DataBridgeConfig.builder().defaultPartitions(0));
@@ -172,6 +209,8 @@ class DataBridgeConfigTest {
             .shutdownTimeout(Duration.ofSeconds(15))
             .closeForceTimeout(Duration.ofSeconds(2))
             .pollBackoff(Duration.ofMillis(500))
+            .publishFailureThreshold(7)
+            .publishFailureCooldown(Duration.ofSeconds(45))
             .defaultPartitions(6)
             .defaultReplicationFactor((short) 3)
             .build();
@@ -182,6 +221,8 @@ class DataBridgeConfigTest {
     assertEquals(Duration.ofSeconds(15), cfg.shutdownTimeout());
     assertEquals(Duration.ofSeconds(2), cfg.closeForceTimeout());
     assertEquals(Duration.ofMillis(500), cfg.pollBackoff());
+    assertEquals(7, cfg.publishFailureThreshold());
+    assertEquals(Duration.ofSeconds(45), cfg.publishFailureCooldown());
     assertEquals(6, cfg.defaultPartitions());
     assertEquals((short) 3, cfg.defaultReplicationFactor());
   }
