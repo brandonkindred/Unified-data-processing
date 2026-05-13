@@ -329,6 +329,45 @@ class DataRelayTest {
   }
 
   @Test
+  void acknowledgeFails_backsOffAndRetries_workerStaysAlive() throws Exception {
+    // First poll returns one message; second poll returns empty. Without ack retry, a thrown
+    // RuntimeException from acknowledge() would escape the worker lambda and silently kill the
+    // poll loop while isRunning() still returned true.
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of());
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    AtomicInteger ackAttempts = new AtomicInteger();
+    doAnswer(
+            inv -> {
+              int n = ackAttempts.incrementAndGet();
+              if (n == 1) {
+                throw new RuntimeException("transient commit failure");
+              }
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "ack should succeed on retry");
+    assertTrue(relay.isRunning(), "worker should still be alive after transient ack failure");
+    relay.close();
+
+    // 2 ack attempts: first throws, retry succeeds. 1 backoff sleep.
+    verify(consumerA, times(2)).acknowledge(any(Message.class));
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
   void failingDestinationDoesNotBlockHealthyDestination() throws Exception {
     AtomicInteger counter = new AtomicInteger();
     when(consumerA.poll(any(Duration.class)))

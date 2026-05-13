@@ -482,13 +482,15 @@ try (DataRelay relay = new DataRelay(cfg)) {
 
 1. **At-least-once delivery.** A backbone message is acked only after the
    downstream publish has been confirmed within `publishTimeout`. If the
-   downstream publish times out or fails, the registration's poll loop
-   **pauses on that message and retries it** with `pollBackoff` until the
-   publish succeeds or `close()` is called — the consumer is not polled again
-   in the meantime. This keeps the consumer's delivered/acked cursor
-   contiguous, so backbone consumers (e.g. the project's Kafka consumer
-   wrapper) don't strand the failed offset behind later, successfully-published
-   records that would become duplicates after restart.
+   downstream publish times out or fails — or if the source consumer's
+   `acknowledge(...)` itself throws (e.g. transient Kafka `commitSync` /
+   GCP ack-RPC failures) — the registration's poll loop **pauses on that
+   message and retries the failed step** with `pollBackoff` until it
+   succeeds or `close()` is called. The consumer is not polled again in
+   the meantime, so its delivered/acked cursor stays contiguous and a
+   `KafkaConsumer` source won't strand the failed offset behind later,
+   successfully-published records that would become duplicates after
+   restart. A transient ack failure no longer silently kills the worker.
 2. **Layered provenance.** The relay stamps `relay.destinationId`,
    `relay.sourceTopic`, and `relay.downstreamTopic` on every published message
    (the keys are exposed as `RelayAttributes.RELAY_DESTINATION_ID` /

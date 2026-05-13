@@ -272,7 +272,9 @@ public final class DataRelay implements AutoCloseable {
       if (state != State.Running) {
         return true;
       }
-      reg.consumer().acknowledge(m);
+      if (!acknowledgeWithRetry(reg, m)) {
+        return false;
+      }
     }
     return true;
   }
@@ -307,6 +309,41 @@ public final class DataRelay implements AutoCloseable {
                 + "/"
                 + reg.downstreamTopic()
                 + "; pausing and retrying the same message",
+            e);
+        try {
+          sleeper.sleep(config.pollBackoff());
+        } catch (InterruptedException sleepInterrupt) {
+          Thread.currentThread().interrupt();
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Acknowledges a successfully-published message on the source consumer, retrying on transient
+   * failure with {@code pollBackoff} until success or {@code close()}. Returning {@code false}
+   * indicates the worker was interrupted and the poll loop should exit.
+   *
+   * <p>Underlying consumers can throw on ack for recoverable reasons — {@code KafkaConsumer}'s
+   * {@code commitSync} during a rebalance, GCP Pub/Sub's ack RPC, etc. Letting that exception
+   * escape the worker would silently kill the registration's poll loop while {@link #isRunning()}
+   * still returned {@code true}.
+   */
+  private boolean acknowledgeWithRetry(RelayRegistration reg, Message m) {
+    while (state == State.Running) {
+      try {
+        reg.consumer().acknowledge(m);
+        return true;
+      } catch (RuntimeException e) {
+        LOG.log(
+            Level.WARNING,
+            "acknowledge failed for "
+                + reg.destinationId()
+                + "/"
+                + reg.sourceTopic()
+                + "; backing off and retrying the same ack",
             e);
         try {
           sleeper.sleep(config.pollBackoff());
