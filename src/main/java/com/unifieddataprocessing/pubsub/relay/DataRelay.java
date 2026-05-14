@@ -210,8 +210,17 @@ public final class DataRelay implements AutoCloseable {
       ExecutorService allocatedExecutor,
       List<PubSubConsumer> connectedConsumers,
       List<PubSubPublisher> connectedPublishers) {
+    // Flip state to Closed BEFORE we start tearing things down. If any worker tasks have already
+    // been submitted (e.g. an executor rejected a later submit while earlier ones were accepted),
+    // they re-check {@code state == Running} between every poll/publish/ack step — flipping state
+    // first lets them exit cleanly without touching clients we're about to close. Then
+    // {@code shutdownNow} interrupts anyone still blocked, and we wait up to
+    // {@code closeForceTimeout} for them to actually exit before closing the consumers/publishers
+    // they may have been calling into.
+    state = State.Closed;
     if (allocatedExecutor != null) {
       allocatedExecutor.shutdownNow();
+      awaitQuietly(allocatedExecutor, config.closeForceTimeout().toMillis());
     }
     for (PubSubConsumer c : connectedConsumers) {
       try {
@@ -227,7 +236,6 @@ public final class DataRelay implements AutoCloseable {
         // best-effort
       }
     }
-    state = State.Closed;
   }
 
   /**

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -31,7 +32,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -744,6 +747,69 @@ class DataRelayTest {
     verify(consumerB, never()).connect();
     verify(publisherA, times(1)).close();
     verify(publisherB, never()).close();
+  }
+
+  @Test
+  void start_failureAfterWorkersSubmitted_flipsStateAndAwaitsBeforeClosingClients()
+      throws Exception {
+    // Force the 2nd executor.submit() to reject so cleanupAfterFailedStart runs while at least
+    // one worker has already been submitted. The cleanup must:
+    //   1. Flip state to Closed *before* closing clients, so any worker still in poll()/publish()
+    //      sees state != Running on its next check and exits without touching closed clients.
+    //   2. Await executor termination (with closeForceTimeout) before closing the consumers and
+    //      publishers those workers may still be calling into.
+    ExecutorService rejectingExec = mock(ExecutorService.class);
+    AtomicInteger submitCount = new AtomicInteger();
+    when(rejectingExec.submit(any(Runnable.class)))
+        .thenAnswer(
+            inv -> {
+              if (submitCount.incrementAndGet() >= 2) {
+                throw new RejectedExecutionException("simulated reject on second submit");
+              }
+              return null;
+            });
+    when(rejectingExec.awaitTermination(anyLong(), any())).thenReturn(true);
+    singleThreadFactory = n -> rejectingExec;
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+
+    // Snapshot relay.isRunning() at the moment each client is closed by cleanup.
+    AtomicBoolean consumerCloseSawRunning = new AtomicBoolean();
+    AtomicBoolean publisherCloseSawRunning = new AtomicBoolean();
+    doAnswer(
+            inv -> {
+              consumerCloseSawRunning.set(relay.isRunning());
+              return null;
+            })
+        .when(consumerA)
+        .close();
+    doAnswer(
+            inv -> {
+              publisherCloseSawRunning.set(relay.isRunning());
+              return null;
+            })
+        .when(publisherA)
+        .close();
+
+    assertThrows(RuntimeException.class, relay::start);
+    assertFalse(relay.isRunning());
+
+    // State must have been flipped to Closed before clients were closed.
+    assertFalse(
+        consumerCloseSawRunning.get(),
+        "state must flip to Closed before consumer.close() during failed-start cleanup");
+    assertFalse(
+        publisherCloseSawRunning.get(),
+        "state must flip to Closed before publisher.close() during failed-start cleanup");
+
+    // Cleanup must shut down the executor AND await termination before touching the clients.
+    InOrder order = inOrder(rejectingExec, consumerA, publisherA);
+    order.verify(rejectingExec).shutdownNow();
+    order.verify(rejectingExec).awaitTermination(anyLong(), any());
+    order.verify(consumerA).close();
+    order.verify(publisherA).close();
   }
 
   @Test
