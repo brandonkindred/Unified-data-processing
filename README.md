@@ -433,6 +433,80 @@ try (DataBridge bridge = new DataBridge(cfg)) {
 executor (graceful `shutdownTimeout` then forced `closeForceTimeout`), flushes
 the publisher, then closes every consumer and the publisher.
 
+### Attaching schemas to bridge topics
+
+Each bridge topic (`sourceId.channel`) can carry a schema — registered in a
+`SchemaRegistry` keyed by the **target topic name** — so the bridge can validate
+every payload before it is published. Schema enforcement is opt-in **per topic**:
+a topic with no registered schema is passed through unchanged.
+
+```java
+import com.unifieddataprocessing.pubsub.bridge.DataBridge;
+import com.unifieddataprocessing.pubsub.bridge.DataBridgeConfig;
+import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
+import com.unifieddataprocessing.pubsub.schema.InMemorySchemaRegistry;
+import com.unifieddataprocessing.pubsub.schema.SchemaRegistry;
+import com.unifieddataprocessing.pubsub.schema.SchemaViolationPolicy;
+import com.unifieddataprocessing.pubsub.schema.validators.CompositeSchemaValidator;
+import com.unifieddataprocessing.pubsub.schema.validators.MaxPayloadSizeSchemaValidator;
+import com.unifieddataprocessing.pubsub.schema.validators.PermissiveSchemaValidator;
+
+SchemaRegistry registry = new InMemorySchemaRegistry();
+registry.register("shopify.orders", "JSON", "{\"type\":\"object\"}");
+
+DataBridgeConfig cfg = DataBridgeConfig.builder()
+    .producerConfig(new KafkaProducerConfig("kafka:9092"))
+    .schemaRegistry(registry)
+    .schemaValidator(
+        CompositeSchemaValidator.builder()
+            .forType("JSON", new MaxPayloadSizeSchemaValidator(1 << 20))  // 1 MiB
+            .fallback(new PermissiveSchemaValidator())
+            .build())
+    .schemaViolationPolicy(SchemaViolationPolicy.DROP)  // or FAIL to redeliver
+    .build();
+```
+
+Semantics:
+
+1. **Subject = target topic.** Schemas are keyed by `sourceId.channel` — the
+   exact name the bridge republishes to. `register("shopify.orders", "JSON",
+   body)` attaches a schema to the `shopify.orders` Kafka topic; calling
+   `register(...)` again on the same subject allocates a new, monotonically
+   increasing version (starting at `1`).
+2. **Latest version wins on the hot path.** The bridge resolves the latest
+   schema per batch and validates every message in that batch against it. A new
+   schema registered mid-stream is picked up on the next poll.
+3. **Opt-in per topic.** `latest(subject)` returns empty for topics that have
+   never been registered, in which case the bridge skips validation and behaves
+   exactly like a bridge with no schema registry configured.
+4. **Violation policy.** On `ValidationResult.valid() == false`:
+   - `SchemaViolationPolicy.DROP` (default) — log + ack the source + skip the
+     publish. Use when malformed messages should not stall the pipeline.
+   - `SchemaViolationPolicy.FAIL` — log + break the batch without acking. The
+     source redelivers the message; if violations persist they will trip the
+     per-registration publish circuit breaker just like real publish failures.
+5. **Provenance stamping.** When validation passes, the bridge stamps two extra
+   attributes on the republished message:
+   - `bridge.schemaSubject` (`BridgeAttributes.BRIDGE_SCHEMA_SUBJECT`)
+   - `bridge.schemaVersion` (`BridgeAttributes.BRIDGE_SCHEMA_VERSION`, decimal)
+   so downstream consumers can route or decode by version. Messages on topics
+   with no registered schema do not carry these attributes.
+6. **Validator is pluggable.** `SchemaValidator` is a functional interface:
+   `ValidationResult validate(Schema schema, byte[] payload)`. Implementations
+   must be thread-safe (the bridge invokes them from N worker threads).
+   Bundled helpers — `PermissiveSchemaValidator`,
+   `MaxPayloadSizeSchemaValidator`, and `CompositeSchemaValidator` (dispatches
+   on `Schema.type()`) — cover the basics; plug in real JSON Schema, Avro, or
+   Protobuf validators by implementing the interface.
+7. **Validator exceptions = violations.** If a validator throws, the bridge
+   converts the throwable into a failing `ValidationResult` and applies the
+   configured policy — a buggy validator never crashes the poll loop.
+
+The schema registry is its own service: it can be inspected (`latest`,
+`get(subject, version)`, `versions(subject)`, `subjects()`) and updated
+(`register(...)`, `deleteSubject(...)`) independently from the bridge, so a
+control plane can publish new versions or back out broken ones at runtime.
+
 ## Usage — DataRelay
 
 `DataRelay` is the symmetric inverse of `DataBridge`: it pulls from the unified
@@ -616,6 +690,18 @@ src/main/java/com/unifieddataprocessing/pubsub/
 │   ├── RelayAttributes.java           RELAY_DESTINATION_ID/_SOURCE_TOPIC/_DOWNSTREAM_TOPIC keys
 │   ├── RelayMessageRewriter.java      stamps relay provenance attributes
 │   └── Sleeper.java
+├── schema/                            schema registry + validators
+│   ├── Schema.java                    immutable subject/version/type/definition record
+│   ├── SchemaRegistry.java            interface: register / latest / get / versions
+│   ├── InMemorySchemaRegistry.java    thread-safe in-memory implementation
+│   ├── SchemaValidator.java           functional interface: validate(schema, payload)
+│   ├── ValidationResult.java          valid flag + immutable errors list
+│   ├── SchemaViolationPolicy.java     DROP (ack + skip) | FAIL (no ack, break batch)
+│   ├── SubjectNotFoundException.java
+│   ├── VersionNotFoundException.java
+│   └── validators/                    PermissiveSchemaValidator,
+│                                      MaxPayloadSizeSchemaValidator,
+│                                      CompositeSchemaValidator (dispatch by type)
 ├── kafka/                             KafkaProducer/Consumer + configs
 ├── msk/                               MSK IAM / SCRAM config factories
 ├── gcp/                               GCP Pub/Sub publisher/consumer

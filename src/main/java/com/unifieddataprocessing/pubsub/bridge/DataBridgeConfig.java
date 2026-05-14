@@ -1,6 +1,9 @@
 package com.unifieddataprocessing.pubsub.bridge;
 
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
+import com.unifieddataprocessing.pubsub.schema.SchemaRegistry;
+import com.unifieddataprocessing.pubsub.schema.SchemaValidator;
+import com.unifieddataprocessing.pubsub.schema.SchemaViolationPolicy;
 import java.time.Duration;
 import java.util.Objects;
 
@@ -24,6 +27,9 @@ public final class DataBridgeConfig {
   private final Duration publishFailureCooldown;
   private final int defaultPartitions;
   private final short defaultReplicationFactor;
+  private final SchemaRegistry schemaRegistry;
+  private final SchemaValidator schemaValidator;
+  private final SchemaViolationPolicy schemaViolationPolicy;
 
   private DataBridgeConfig(Builder b) {
     this.producerConfig = b.producerConfig;
@@ -36,6 +42,9 @@ public final class DataBridgeConfig {
     this.publishFailureCooldown = b.publishFailureCooldown;
     this.defaultPartitions = b.defaultPartitions;
     this.defaultReplicationFactor = b.defaultReplicationFactor;
+    this.schemaRegistry = b.schemaRegistry;
+    this.schemaValidator = b.schemaValidator;
+    this.schemaViolationPolicy = b.schemaViolationPolicy;
   }
 
   public static Builder builder() {
@@ -92,6 +101,32 @@ public final class DataBridgeConfig {
     return defaultReplicationFactor;
   }
 
+  /**
+   * Registry consulted on every published message to look up the latest schema for the target
+   * topic. {@code null} disables schema validation entirely. When non-null, {@link
+   * #schemaValidator()} must also be non-null.
+   */
+  public SchemaRegistry schemaRegistry() {
+    return schemaRegistry;
+  }
+
+  /**
+   * Validator the bridge invokes against the {@link
+   * com.unifieddataprocessing.pubsub.schema.Schema} returned by {@link #schemaRegistry()} for each
+   * outgoing message. {@code null} when schema validation is disabled.
+   */
+  public SchemaValidator schemaValidator() {
+    return schemaValidator;
+  }
+
+  /**
+   * Behavior the bridge applies when a message fails schema validation. Defaults to {@link
+   * SchemaViolationPolicy#DROP}; ignored when {@link #schemaRegistry()} is {@code null}.
+   */
+  public SchemaViolationPolicy schemaViolationPolicy() {
+    return schemaViolationPolicy;
+  }
+
   /** Fluent builder for {@link DataBridgeConfig}. */
   public static final class Builder {
 
@@ -105,6 +140,9 @@ public final class DataBridgeConfig {
     private Duration publishFailureCooldown = Duration.ofSeconds(30);
     private int defaultPartitions = 1;
     private short defaultReplicationFactor = 1;
+    private SchemaRegistry schemaRegistry;
+    private SchemaValidator schemaValidator;
+    private SchemaViolationPolicy schemaViolationPolicy = SchemaViolationPolicy.DROP;
 
     private Builder() {}
 
@@ -190,10 +228,47 @@ public final class DataBridgeConfig {
       return this;
     }
 
+    /**
+     * Registry the bridge consults on every published message. Setting this enables schema
+     * validation on the publish hot path; {@link #schemaValidator(SchemaValidator)} must also be
+     * set before {@link #build()}. Pass {@code null} to disable validation.
+     */
+    public Builder schemaRegistry(SchemaRegistry schemaRegistry) {
+      this.schemaRegistry = schemaRegistry;
+      return this;
+    }
+
+    /**
+     * Validator the bridge invokes against each schema returned by {@link #schemaRegistry()}.
+     * Required when a registry is set. Pass {@code null} to clear.
+     */
+    public Builder schemaValidator(SchemaValidator schemaValidator) {
+      this.schemaValidator = schemaValidator;
+      return this;
+    }
+
+    /**
+     * Policy applied when a payload fails schema validation. Defaults to {@link
+     * SchemaViolationPolicy#DROP}. Non-null.
+     */
+    public Builder schemaViolationPolicy(SchemaViolationPolicy schemaViolationPolicy) {
+      this.schemaViolationPolicy =
+          Objects.requireNonNull(schemaViolationPolicy, "schemaViolationPolicy");
+      return this;
+    }
+
     /** Builds an immutable {@link DataBridgeConfig}; throws if {@code producerConfig} is unset. */
     public DataBridgeConfig build() {
       if (producerConfig == null) {
         throw new IllegalStateException("producerConfig is required");
+      }
+      if (schemaRegistry != null && schemaValidator == null) {
+        throw new IllegalStateException(
+            "schemaValidator is required when schemaRegistry is set");
+      }
+      if (schemaValidator != null && schemaRegistry == null) {
+        throw new IllegalStateException(
+            "schemaRegistry is required when schemaValidator is set");
       }
       return new DataBridgeConfig(this);
     }

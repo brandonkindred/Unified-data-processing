@@ -5,12 +5,18 @@ import com.unifieddataprocessing.pubsub.PubSubConsumer;
 import com.unifieddataprocessing.pubsub.PubSubPublisher;
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducer;
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
+import com.unifieddataprocessing.pubsub.schema.Schema;
+import com.unifieddataprocessing.pubsub.schema.SchemaRegistry;
+import com.unifieddataprocessing.pubsub.schema.SchemaValidator;
+import com.unifieddataprocessing.pubsub.schema.SchemaViolationPolicy;
+import com.unifieddataprocessing.pubsub.schema.ValidationResult;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
@@ -50,6 +56,16 @@ import org.apache.kafka.clients.admin.AdminClient;
  * A single successful publish drops the counter back to zero (healthy). Per-channel
  * {@link ChannelOptions} layered over the {@link DataBridgeConfig} defaults control each topic's
  * partitions, replication factor, and Kafka topic-configs at provision time.
+ *
+ * <p>When a {@link SchemaRegistry} and {@link SchemaValidator} are configured on the {@link
+ * DataBridgeConfig}, every batch resolves the latest schema for the registration's target topic
+ * once and validates each payload before publishing. Topics with no registered schema are passed
+ * through unchanged — schema enforcement is opt-in per topic. On violation, the configured {@link
+ * SchemaViolationPolicy} decides whether the message is dropped (acked + skipped) or treated as a
+ * publish failure (no ack, batch broken, circuit-breaker counts the failure). Successful
+ * validation stamps {@link BridgeAttributes#BRIDGE_SCHEMA_SUBJECT} and {@link
+ * BridgeAttributes#BRIDGE_SCHEMA_VERSION} on the republished message so downstream consumers can
+ * route or decode by version.
  */
 public final class DataBridge implements AutoCloseable {
 
@@ -332,11 +348,36 @@ public final class DataBridge implements AutoCloseable {
 
   private BatchResult processBatch(Registration reg, PubSubPublisher pub, List<Message> batch) {
     boolean anyPublishSucceeded = false;
+    // Resolve the schema once per batch: stable view across the batch even if a new version is
+    // registered mid-iteration, while still picking up registry updates on the next poll.
+    Schema schema = resolveSchema(reg);
     for (Message m : batch) {
       if (state != State.Running) {
         return new BatchResult(anyPublishSucceeded, false, false);
       }
-      Message rewritten = MessageRewriter.rewrite(m, reg);
+      if (schema != null) {
+        ValidationResult result = validate(schema, m, reg);
+        if (!result.valid()) {
+          SchemaViolationPolicy policy = config.schemaViolationPolicy();
+          LOG.log(
+              Level.WARNING,
+              "schema violation on {0} (subject={1} v{2}, policy={3}): {4}",
+              new Object[] {
+                reg.targetTopic(),
+                schema.subject(),
+                schema.version(),
+                policy,
+                result.errors()
+              });
+          if (policy == SchemaViolationPolicy.FAIL) {
+            return new BatchResult(anyPublishSucceeded, true, false);
+          }
+          // DROP: ack the source so it does not redeliver, then continue with the batch.
+          reg.consumer().acknowledge(m);
+          continue;
+        }
+      }
+      Message rewritten = MessageRewriter.rewrite(m, reg, schema);
       try {
         pub.publish(rewritten).get(config.publishTimeout().toMillis(), TimeUnit.MILLISECONDS);
       } catch (InterruptedException ie) {
@@ -353,6 +394,33 @@ public final class DataBridge implements AutoCloseable {
       reg.consumer().acknowledge(m);
     }
     return new BatchResult(anyPublishSucceeded, false, false);
+  }
+
+  private Schema resolveSchema(Registration reg) {
+    SchemaRegistry registry = config.schemaRegistry();
+    if (registry == null) {
+      return null;
+    }
+    Optional<Schema> latest = registry.latest(reg.targetTopic());
+    return latest.orElse(null);
+  }
+
+  private ValidationResult validate(Schema schema, Message m, Registration reg) {
+    SchemaValidator validator = config.schemaValidator();
+    try {
+      ValidationResult result = validator.validate(schema, m.getPayload());
+      if (result == null) {
+        return ValidationResult.fail(
+            "validator returned null for " + reg.targetTopic());
+      }
+      return result;
+    } catch (RuntimeException e) {
+      LOG.log(
+          Level.WARNING,
+          "schema validator threw for " + reg.targetTopic() + "; treating as violation",
+          e);
+      return ValidationResult.fail("validator threw: " + e.getMessage());
+    }
   }
 
   private static boolean awaitQuietly(ExecutorService exec, long millis) {

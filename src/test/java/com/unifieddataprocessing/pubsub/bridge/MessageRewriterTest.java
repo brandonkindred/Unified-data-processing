@@ -2,10 +2,12 @@ package com.unifieddataprocessing.pubsub.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 import com.unifieddataprocessing.pubsub.Message;
 import com.unifieddataprocessing.pubsub.PubSubConsumer;
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducer;
+import com.unifieddataprocessing.pubsub.schema.Schema;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Collections;
@@ -83,6 +85,24 @@ class MessageRewriterTest {
     Message src = new Message("id-1", "src-topic", payload("p"), attrs);
     Message out = MessageRewriter.rewrite(src, REGISTRATION);
     assertEquals("orders", out.getAttributes().get(BridgeAttributes.BRIDGE_CHANNEL));
+  }
+
+  @Test
+  void schemaAttributes_notSet_whenSchemaIsNull() {
+    Message src = new Message("id-1", "src-topic", payload("p"), Map.of());
+    Message out = MessageRewriter.rewrite(src, REGISTRATION, null);
+    assertFalse(out.getAttributes().containsKey(BridgeAttributes.BRIDGE_SCHEMA_SUBJECT));
+    assertFalse(out.getAttributes().containsKey(BridgeAttributes.BRIDGE_SCHEMA_VERSION));
+  }
+
+  @Test
+  void schemaAttributes_setFromSchema_whenProvided() {
+    Schema schema = new Schema("shopify.orders", 7, "JSON", "{}");
+    Message src = new Message("id-1", "src-topic", payload("p"), Map.of());
+    Message out = MessageRewriter.rewrite(src, REGISTRATION, schema);
+    assertEquals(
+        "shopify.orders", out.getAttributes().get(BridgeAttributes.BRIDGE_SCHEMA_SUBJECT));
+    assertEquals("7", out.getAttributes().get(BridgeAttributes.BRIDGE_SCHEMA_VERSION));
   }
 
   private static byte[] payload(String s) {

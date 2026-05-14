@@ -16,5 +16,17 @@ public final class BridgeAttributes {
   /** Logical channel name within the source (e.g. {@code "orders"}). */
   public static final String BRIDGE_CHANNEL = "bridge.channel";
 
+  /**
+   * Schema subject the message was validated against (when the bridge is configured with a {@link
+   * com.unifieddataprocessing.pubsub.schema.SchemaRegistry}). Always equals the target topic name.
+   */
+  public static final String BRIDGE_SCHEMA_SUBJECT = "bridge.schemaSubject";
+
+  /**
+   * Decimal-encoded {@link com.unifieddataprocessing.pubsub.schema.Schema#version()} the message
+   * was validated against. Set only when validation actually ran and passed.
+   */
+  public static final String BRIDGE_SCHEMA_VERSION = "bridge.schemaVersion";
+
   private BridgeAttributes() {}
 }

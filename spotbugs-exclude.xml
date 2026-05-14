@@ -49,6 +49,31 @@
     <Method name="getTopicConfigs"/>
     <Bug pattern="EI_EXPOSE_REP"/>
   </Match>
+  <!--
+    ValidationResult.errors() is the synthetic record accessor for a List
+    that was already defensively copied (List.copyOf) in the compact
+    constructor. SpotBugs cannot infer that the returned list is immutable.
+  -->
+  <Match>
+    <Class name="com.unifieddataprocessing.pubsub.schema.ValidationResult"/>
+    <Method name="errors"/>
+    <Bug pattern="EI_EXPOSE_REP"/>
+  </Match>
+  <!--
+    SchemaRegistry is a stateful service shared between the bridge and its
+    control-plane caller by design — getter / builder setter holding the same
+    reference is intentional, not a leak.
+  -->
+  <Match>
+    <Class name="com.unifieddataprocessing.pubsub.bridge.DataBridgeConfig"/>
+    <Method name="schemaRegistry"/>
+    <Bug pattern="EI_EXPOSE_REP"/>
+  </Match>
+  <Match>
+    <Class name="com.unifieddataprocessing.pubsub.bridge.DataBridgeConfig$Builder"/>
+    <Method name="schemaRegistry"/>
+    <Bug pattern="EI_EXPOSE_REP2"/>
+  </Match>
 
   <!--
     DataBridge.sleeper is wired into the test ctor for #19 but only read once

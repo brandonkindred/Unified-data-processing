@@ -1,10 +1,17 @@
 package com.unifieddataprocessing.pubsub.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.unifieddataprocessing.pubsub.kafka.KafkaProducerConfig;
+import com.unifieddataprocessing.pubsub.schema.InMemorySchemaRegistry;
+import com.unifieddataprocessing.pubsub.schema.SchemaRegistry;
+import com.unifieddataprocessing.pubsub.schema.SchemaValidator;
+import com.unifieddataprocessing.pubsub.schema.SchemaViolationPolicy;
+import com.unifieddataprocessing.pubsub.schema.ValidationResult;
+import com.unifieddataprocessing.pubsub.schema.validators.PermissiveSchemaValidator;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 
@@ -26,6 +33,55 @@ class DataBridgeConfigTest {
     assertEquals(Duration.ofSeconds(30), cfg.publishFailureCooldown());
     assertEquals(1, cfg.defaultPartitions());
     assertEquals((short) 1, cfg.defaultReplicationFactor());
+    assertNull(cfg.schemaRegistry());
+    assertNull(cfg.schemaValidator());
+    assertEquals(SchemaViolationPolicy.DROP, cfg.schemaViolationPolicy());
+  }
+
+  @Test
+  void schemaRegistry_set_withoutValidator_throws() {
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            DataBridgeConfig.builder()
+                .producerConfig(PRODUCER)
+                .schemaRegistry(new InMemorySchemaRegistry())
+                .build());
+  }
+
+  @Test
+  void schemaValidator_set_withoutRegistry_throws() {
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            DataBridgeConfig.builder()
+                .producerConfig(PRODUCER)
+                .schemaValidator(new PermissiveSchemaValidator())
+                .build());
+  }
+
+  @Test
+  void schemaRegistry_and_validator_set_together_succeeds() {
+    SchemaRegistry registry = new InMemorySchemaRegistry();
+    SchemaValidator validator =
+        (schema, payload) -> ValidationResult.ok();
+    DataBridgeConfig cfg =
+        DataBridgeConfig.builder()
+            .producerConfig(PRODUCER)
+            .schemaRegistry(registry)
+            .schemaValidator(validator)
+            .schemaViolationPolicy(SchemaViolationPolicy.FAIL)
+            .build();
+    assertSame(registry, cfg.schemaRegistry());
+    assertSame(validator, cfg.schemaValidator());
+    assertEquals(SchemaViolationPolicy.FAIL, cfg.schemaViolationPolicy());
+  }
+
+  @Test
+  void schemaViolationPolicy_null_throws() {
+    assertThrows(
+        NullPointerException.class,
+        () -> DataBridgeConfig.builder().schemaViolationPolicy(null));
   }
 
   @Test
