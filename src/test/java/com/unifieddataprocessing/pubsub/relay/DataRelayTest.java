@@ -512,6 +512,57 @@ class DataRelayTest {
   }
 
   @Test
+  void publishTimeout_subMillisecond_preservesNanosecondBudget() throws Exception {
+    // A 500us publishTimeout that previously got truncated to 0ms by .toMillis() would have made
+    // every Future.get(0, MILLISECONDS) an immediate non-blocking check, timing out every async
+    // publish and looping forever. With nanosecond-precision get(), a future that completes
+    // within ~500us must be observed as successful, not as a TimeoutException.
+    config =
+        DataRelayConfig.builder()
+            .pollTimeout(Duration.ofMillis(50))
+            .publishTimeout(Duration.ofNanos(500_000)) // 0.5 ms — under the 1 ms toMillis() floor
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .build();
+
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of());
+    // Future completes IMMEDIATELY (so well within the 0.5ms budget). With the old toMillis()
+    // implementation, get(0, MS) raced the immediate completion and could even succeed by luck;
+    // we instead pin the assertion to "no retry / no backoff sleep" to prove the budget didn't
+    // get truncated to zero.
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS));
+    relay.close();
+
+    // Exactly one publish + one ack. No pollBackoff sleep — proves we didn't treat the publish as
+    // a timeout and re-enter the retry path.
+    verify(publisherA, times(1)).publish(any(Message.class));
+    verify(consumerA, times(1)).acknowledge(any(Message.class));
+    assertTrue(
+        sleeper.sleeps.isEmpty(),
+        "no backoff sleep expected; got " + sleeper.sleeps);
+  }
+
+  @Test
   void failingDestinationDoesNotBlockHealthyDestination() throws Exception {
     AtomicInteger counter = new AtomicInteger();
     when(consumerA.poll(any(Duration.class)))

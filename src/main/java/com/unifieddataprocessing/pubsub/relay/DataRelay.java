@@ -385,7 +385,7 @@ public final class DataRelay implements AutoCloseable {
       try {
         reg.publisher()
             .publish(rewritten)
-            .get(config.publishTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            .get(config.publishTimeout().toNanos(), TimeUnit.NANOSECONDS);
         return true;
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
