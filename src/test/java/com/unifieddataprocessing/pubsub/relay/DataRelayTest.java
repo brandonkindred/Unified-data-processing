@@ -10,6 +10,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -329,26 +330,30 @@ class DataRelayTest {
   }
 
   @Test
-  void acknowledgeFails_backsOffAndRetries_workerStaysAlive() throws Exception {
-    // First poll returns one message; second poll returns empty. Without ack retry, a thrown
-    // RuntimeException from acknowledge() would escape the worker lambda and silently kill the
-    // poll loop while isRunning() still returned true.
+  void acknowledgeFails_breaksBatchAndRecoversOnNextPoll_workerStaysAlive() throws Exception {
+    // ack failures (e.g. KafkaConsumer.commitSync during rebalance) cannot be retried in place —
+    // the consumer must poll() again to drive its state machine forward (e.g. complete the
+    // rebalance) before any commit can succeed. The relay must therefore log + sleep
+    // pollBackoff + break the batch on ack failure, NOT loop forever on the same ack.
     Message m1 = msg("m-1", "shopify.orders", Map.of());
+    // First poll: deliver m1 → publish succeeds → ack throws → batch breaks.
+    // Second poll: simulate redelivery (Kafka would re-deliver after rebalance) → ack succeeds.
     when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
         .thenReturn(List.of(m1))
         .thenReturn(List.of());
     when(publisherA.publish(any(Message.class)))
         .thenReturn(CompletableFuture.completedFuture(null));
 
-    CountDownLatch ackLatch = new CountDownLatch(1);
+    CountDownLatch successAckLatch = new CountDownLatch(1);
     AtomicInteger ackAttempts = new AtomicInteger();
     doAnswer(
             inv -> {
               int n = ackAttempts.incrementAndGet();
               if (n == 1) {
-                throw new RuntimeException("transient commit failure");
+                throw new RuntimeException("transient commit failure (rebalance)");
               }
-              ackLatch.countDown();
+              successAckLatch.countDown();
               return null;
             })
         .when(consumerA)
@@ -358,12 +363,17 @@ class DataRelayTest {
     DataRelay relay = newRelay(sleeper);
     relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
     relay.start();
-    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "ack should succeed on retry");
+    assertTrue(
+        successAckLatch.await(2, TimeUnit.SECONDS),
+        "ack should succeed on the second poll's redelivery, not via in-place retry");
     assertTrue(relay.isRunning(), "worker should still be alive after transient ack failure");
     relay.close();
 
-    // 2 ack attempts: first throws, retry succeeds. 1 backoff sleep.
+    // The relay must have re-polled (>= 2 polls) rather than spin-retrying the same ack.
+    verify(consumerA, atLeast(2)).poll(any(Duration.class));
+    // Two ack attempts total: first throws, second (after re-poll) succeeds.
     verify(consumerA, times(2)).acknowledge(any(Message.class));
+    // Exactly one backoff sleep, after the failed ack.
     assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
   }
 
@@ -699,6 +709,61 @@ class DataRelayTest {
         "publisherB.flush() should have run despite publisherA.flush() hanging");
     verify(publisherA).close();
     verify(publisherB).close();
+  }
+
+  @Test
+  void close_manyHungPublishers_respectsTotalCloseForceTimeout() throws Exception {
+    // 50 registrations all with hung flush() that ignores interruption. Per-flush slice would be
+    // closeForceTimeout / 50; with the prior 1ms floor, total wall time would be ~50 ms in this
+    // small case but inflate dramatically for thousands of registrations. The total-deadline cap
+    // ensures we never exceed closeForceTimeout regardless of N.
+    int n = 50;
+    @SuppressWarnings("unchecked")
+    PubSubConsumer[] consumers = new PubSubConsumer[n];
+    @SuppressWarnings("unchecked")
+    PubSubPublisher[] publishers = new PubSubPublisher[n];
+    CountDownLatch flushReleaser = new CountDownLatch(1);
+    for (int i = 0; i < n; i++) {
+      consumers[i] = mock(PubSubConsumer.class);
+      publishers[i] = mock(PubSubPublisher.class);
+      lenient().when(consumers[i].poll(any(Duration.class))).thenReturn(List.of());
+      // Lenient: the whole point of the test is that the total budget exhausts before every
+      // publisher is reached, so some flush() stubs intentionally go unused.
+      lenient()
+          .doAnswer(
+              inv -> {
+                while (!flushReleaser.await(50, TimeUnit.MILLISECONDS)) {
+                  Thread.interrupted(); // ignore interruption
+                }
+                return null;
+              })
+          .when(publishers[i])
+          .flush();
+    }
+
+    singleThreadFactory = workers -> Executors.newFixedThreadPool(workers);
+    DataRelay relay = newRelay();
+    for (int i = 0; i < n; i++) {
+      relay.register("dest-" + i, "shopify.orders", "topic-" + i, consumers[i], publishers[i]);
+    }
+    relay.start();
+
+    long t0 = System.nanoTime();
+    relay.close();
+    long elapsedNs = System.nanoTime() - t0;
+    flushReleaser.countDown();
+
+    // Total close() must fit shutdownTimeout (executor) + closeForceTimeout (flush phase) + grace.
+    // In particular, the flush phase alone must be bounded by closeForceTimeout, NOT
+    // n * per-flush-slice with a 1ms floor.
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofSeconds(1));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() of " + n + " hung publishers took "
+            + Duration.ofNanos(elapsedNs)
+            + " but budget is "
+            + budget);
   }
 
   @Test

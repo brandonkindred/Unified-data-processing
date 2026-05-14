@@ -231,27 +231,36 @@ public final class DataRelay implements AutoCloseable {
   }
 
   /**
-   * Flushes every registered publisher with a total wall-time budget of {@code closeForceTimeout},
-   * so a publisher whose {@code flush()} would block forever on a stale in-flight publish future
-   * (the {@code CompletableFuture} a timed-out {@code .get()} left outstanding in
-   * {@link #publishWithRetry}) cannot bypass the relay's declared shutdown budget.
+   * Flushes every registered publisher with a hard total wall-time budget of
+   * {@code closeForceTimeout}, so a publisher whose {@code flush()} would block forever on a
+   * stale in-flight publish future (the {@code CompletableFuture} a timed-out {@code .get()} left
+   * outstanding in {@link #publishWithRetry}) cannot bypass the relay's declared shutdown budget.
    *
-   * <p>The budget is split into equal {@code closeForceTimeout / registrations.size()} per-flush
-   * slices (with a 1 ms floor) and each flush runs on its own short-lived daemon thread, so a
-   * flush that hangs and ignores interruption on one publisher consumes only its own slice and
-   * cannot starve later publishers of their fair share. If a slice expires the thread is
-   * interrupted (best-effort) and abandoned — abandoned threads are daemons, so they don't keep
-   * the JVM alive past {@code close()}.
+   * <p>Each flush gets a fair-share slice of {@code closeForceTimeout / registrations.size()},
+   * but every per-flush join is also capped against the time remaining until the
+   * {@code closeForceTimeout} deadline, so the total wall time spent in this method is bounded by
+   * {@code closeForceTimeout} regardless of how many registrations there are or how many flushes
+   * hang. Each flush runs on its own short-lived daemon thread, so a flush that hangs and ignores
+   * interruption on one publisher cannot starve later publishers of their fair share within the
+   * remaining budget. If a slice expires the thread is interrupted (best-effort) and abandoned —
+   * abandoned threads are daemons, so they don't keep the JVM alive past {@code close()}.
    */
   private void flushPublishersBounded() {
     if (registrations.isEmpty()) {
       return;
     }
-    long perFlushNs =
-        Math.max(1_000_000L, config.closeForceTimeout().toNanos() / registrations.size());
-    long joinMs = TimeUnit.NANOSECONDS.toMillis(perFlushNs);
-    int joinNs = (int) (perFlushNs % 1_000_000L);
+    long totalBudgetNs = config.closeForceTimeout().toNanos();
+    long deadlineNs = System.nanoTime() + totalBudgetNs;
+    long fairShareNs = totalBudgetNs / registrations.size();
     for (RelayRegistration reg : registrations) {
+      long remainingNs = deadlineNs - System.nanoTime();
+      if (remainingNs <= 0) {
+        LOG.log(
+            Level.WARNING,
+            "flush budget exhausted; skipping remaining publisher flushes during close()");
+        break;
+      }
+      long sliceNs = Math.min(fairShareNs, remainingNs);
       Thread flushThread =
           new Thread(
               () -> {
@@ -265,7 +274,13 @@ public final class DataRelay implements AutoCloseable {
       flushThread.setDaemon(true);
       flushThread.start();
       try {
-        flushThread.join(joinMs, joinNs);
+        long sliceMs = TimeUnit.NANOSECONDS.toMillis(sliceNs);
+        int sliceNanos = (int) (sliceNs % 1_000_000L);
+        // Thread.join(0, 0) waits forever — guarantee we always pass at least 1 ns.
+        if (sliceMs == 0 && sliceNanos == 0) {
+          sliceNanos = 1;
+        }
+        flushThread.join(sliceMs, sliceNanos);
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
         flushThread.interrupt();
@@ -320,8 +335,14 @@ public final class DataRelay implements AutoCloseable {
       if (state != State.Running) {
         return true;
       }
-      if (!acknowledgeWithRetry(reg, m)) {
+      AckOutcome outcome = tryAcknowledgeOnce(reg, m);
+      if (outcome == AckOutcome.EXIT) {
         return false;
+      }
+      if (outcome == AckOutcome.BREAK_BATCH) {
+        // Let the outer poll loop call poll(...) again — this gives e.g. KafkaConsumer the chance
+        // to complete a pending rebalance, which is required before commitSync can succeed.
+        return true;
       }
     }
     return true;
@@ -369,39 +390,49 @@ public final class DataRelay implements AutoCloseable {
     return true;
   }
 
+  /** Outcome of a single ack attempt; see {@link #tryAcknowledgeOnce}. */
+  private enum AckOutcome {
+    SUCCESS,
+    BREAK_BATCH,
+    EXIT
+  }
+
   /**
-   * Acknowledges a successfully-published message on the source consumer, retrying on transient
-   * failure with {@code pollBackoff} until success or {@code close()}. Returning {@code false}
-   * indicates the worker was interrupted and the poll loop should exit.
+   * Acknowledges a successfully-published message on the source consumer with a single attempt.
+   * Returns {@link AckOutcome#SUCCESS} on success, {@link AckOutcome#EXIT} if the worker was
+   * interrupted while sleeping, or {@link AckOutcome#BREAK_BATCH} on any other ack failure (after
+   * logging and a {@code pollBackoff} sleep).
    *
-   * <p>Underlying consumers can throw on ack for recoverable reasons — {@code KafkaConsumer}'s
-   * {@code commitSync} during a rebalance, GCP Pub/Sub's ack RPC, etc. Letting that exception
-   * escape the worker would silently kill the registration's poll loop while {@link #isRunning()}
-   * still returned {@code true}.
+   * <p>Why one attempt + break batch instead of retry-in-place: ack failures from
+   * {@code KafkaConsumer.commitSync()} during a rebalance cannot be cleared by sleeping and
+   * retrying the same commit — the consumer must call {@code poll(...)} again to drive the
+   * rebalance to completion before any commit can succeed. Retrying the same ack in a tight loop
+   * would stall the registration forever after a downstream publish has already succeeded.
+   * Breaking the batch hands control back to {@link #pollLoopForever}, whose next {@code poll()}
+   * lets the consumer make state-machine progress; any messages already published but not yet
+   * acked may be redelivered and re-published as duplicates (acceptable under at-least-once).
    */
-  private boolean acknowledgeWithRetry(RelayRegistration reg, Message m) {
-    while (state == State.Running) {
+  private AckOutcome tryAcknowledgeOnce(RelayRegistration reg, Message m) {
+    try {
+      reg.consumer().acknowledge(m);
+      return AckOutcome.SUCCESS;
+    } catch (RuntimeException e) {
+      LOG.log(
+          Level.WARNING,
+          "acknowledge failed for "
+              + reg.destinationId()
+              + "/"
+              + reg.sourceTopic()
+              + "; breaking batch so the next poll() can recover (e.g. complete a Kafka rebalance)",
+          e);
       try {
-        reg.consumer().acknowledge(m);
-        return true;
-      } catch (RuntimeException e) {
-        LOG.log(
-            Level.WARNING,
-            "acknowledge failed for "
-                + reg.destinationId()
-                + "/"
-                + reg.sourceTopic()
-                + "; backing off and retrying the same ack",
-            e);
-        try {
-          sleeper.sleep(config.pollBackoff());
-        } catch (InterruptedException sleepInterrupt) {
-          Thread.currentThread().interrupt();
-          return false;
-        }
+        sleeper.sleep(config.pollBackoff());
+      } catch (InterruptedException sleepInterrupt) {
+        Thread.currentThread().interrupt();
+        return AckOutcome.EXIT;
       }
+      return AckOutcome.BREAK_BATCH;
     }
-    return true;
   }
 
   private static boolean awaitQuietly(ExecutorService exec, long millis) {

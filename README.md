@@ -481,16 +481,23 @@ try (DataRelay relay = new DataRelay(cfg)) {
 ### Relay semantics
 
 1. **At-least-once delivery.** A backbone message is acked only after the
-   downstream publish has been confirmed within `publishTimeout`. If the
-   downstream publish times out or fails — or if the source consumer's
-   `acknowledge(...)` itself throws (e.g. transient Kafka `commitSync` /
-   GCP ack-RPC failures) — the registration's poll loop **pauses on that
-   message and retries the failed step** with `pollBackoff` until it
-   succeeds or `close()` is called. The consumer is not polled again in
-   the meantime, so its delivered/acked cursor stays contiguous and a
-   `KafkaConsumer` source won't strand the failed offset behind later,
-   successfully-published records that would become duplicates after
-   restart. A transient ack failure no longer silently kills the worker.
+   downstream publish has been confirmed within `publishTimeout`.
+   - If the **publish** times out or fails, the registration's poll loop
+     pauses on that message and retries the publish with `pollBackoff` until
+     it succeeds or `close()` is called. The consumer is not polled again
+     in the meantime, so its delivered/acked cursor stays contiguous and a
+     `KafkaConsumer` source won't strand the failed offset behind later,
+     successfully-published records that would become duplicates after
+     restart.
+   - If the consumer's **`acknowledge(...)`** throws (e.g. transient Kafka
+     `commitSync` during a rebalance, GCP ack-RPC), the relay logs, sleeps
+     `pollBackoff`, and breaks the batch — the next `poll()` lets the
+     consumer make state-machine progress (in Kafka's case, complete the
+     pending rebalance, which is required before any commit can succeed).
+     Messages that were already published but not yet acked may be
+     redelivered and re-published as duplicates (acceptable under
+     at-least-once). A transient ack failure no longer silently kills the
+     worker.
 2. **Layered provenance.** The relay stamps `relay.destinationId`,
    `relay.sourceTopic`, and `relay.downstreamTopic` on every published message
    (the keys are exposed as `RelayAttributes.RELAY_DESTINATION_ID` /
