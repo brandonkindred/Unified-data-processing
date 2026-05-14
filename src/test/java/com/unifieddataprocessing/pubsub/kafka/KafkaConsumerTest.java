@@ -390,4 +390,44 @@ class KafkaConsumerTest {
     verify(mockKafkaClient)
         .commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(12L))));
   }
+
+  @Test
+  void acknowledge_failedAckCleanedUpWhenSuccessorAdvancesCommit() {
+    // Two messages on the same partition: m1 @ offset 100, m2 @ offset 101.
+    // acknowledge(m1) fails inside commitSync, leaving m1's partitionByMessageId /
+    // offsetByMessageId entries in place (intact-for-retry semantic).
+    // acknowledge(m2) then succeeds, committing past m1's offset via the watermark — without
+    // the sweep, m1's id-keyed side-map entries would leak forever. A subsequent
+    // acknowledge(m1) must therefore now throw "Unknown message" (proving the sweep cleaned
+    // them up), instead of quietly succeeding and leaving the acked set with a stale entry.
+    consumer.connect();
+    TopicPartition tp = new TopicPartition("topic-a", 0);
+    ConsumerRecord<byte[], byte[]> r100 =
+        new ConsumerRecord<>("topic-a", 0, 100L, null, "a".getBytes());
+    ConsumerRecord<byte[], byte[]> r101 =
+        new ConsumerRecord<>("topic-a", 0, 101L, null, "b".getBytes());
+    when(mockKafkaClient.poll(any(Duration.class)))
+        .thenReturn(new ConsumerRecords<>(Map.of(tp, List.of(r100, r101))));
+
+    List<Message> messages = consumer.poll(Duration.ofMillis(10));
+    Message m1 = messages.get(0);
+    Message m2 = messages.get(1);
+
+    // First commitSync (from acknowledge(m1)) throws; second (from acknowledge(m2)) succeeds.
+    doThrow(new CommitFailedException())
+        .doNothing()
+        .when(mockKafkaClient)
+        .commitSync(any(Map.class));
+
+    assertThrows(CommitFailedException.class, () -> consumer.acknowledge(m1));
+    consumer.acknowledge(m2);
+
+    // Commit advanced past both offsets (101 + 1).
+    verify(mockKafkaClient, org.mockito.Mockito.times(1))
+        .commitSync(eq(Collections.singletonMap(tp, new OffsetAndMetadata(102L))));
+
+    // The successful commit's sweep must have cleaned m1's side-map entries even though m1's
+    // own acknowledge threw. A re-ack of m1 therefore looks like an unknown message.
+    assertThrows(IllegalStateException.class, () -> consumer.acknowledge(m1));
+  }
 }

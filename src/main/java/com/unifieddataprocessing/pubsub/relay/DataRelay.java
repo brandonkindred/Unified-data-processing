@@ -3,6 +3,7 @@ package com.unifieddataprocessing.pubsub.relay;
 import com.unifieddataprocessing.pubsub.Message;
 import com.unifieddataprocessing.pubsub.PubSubConsumer;
 import com.unifieddataprocessing.pubsub.PubSubPublisher;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -182,10 +183,10 @@ public final class DataRelay implements AutoCloseable {
 
     if (executor != null) {
       executor.shutdown();
-      boolean terminated = awaitQuietly(executor, config.shutdownTimeout().toMillis());
+      boolean terminated = awaitQuietly(executor, config.shutdownTimeout());
       if (!terminated) {
         executor.shutdownNow();
-        awaitQuietly(executor, config.closeForceTimeout().toMillis());
+        awaitQuietly(executor, config.closeForceTimeout());
       }
     }
 
@@ -220,7 +221,7 @@ public final class DataRelay implements AutoCloseable {
     state = State.Closed;
     if (allocatedExecutor != null) {
       allocatedExecutor.shutdownNow();
-      awaitQuietly(allocatedExecutor, config.closeForceTimeout().toMillis());
+      awaitQuietly(allocatedExecutor, config.closeForceTimeout());
     }
     for (PubSubConsumer c : connectedConsumers) {
       try {
@@ -457,9 +458,9 @@ public final class DataRelay implements AutoCloseable {
     }
   }
 
-  private static boolean awaitQuietly(ExecutorService exec, long millis) {
+  private static boolean awaitQuietly(ExecutorService exec, Duration timeout) {
     try {
-      return exec.awaitTermination(millis, TimeUnit.MILLISECONDS);
+      return exec.awaitTermination(timeout.toNanos(), TimeUnit.NANOSECONDS);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       return false;
