@@ -443,6 +443,8 @@ import com.unifieddataprocessing.pubsub.kinesis.KinesisPublisher;
 import com.unifieddataprocessing.pubsub.kinesis.KinesisPublisherConfig;
 import com.unifieddataprocessing.pubsub.relay.DataRelay;
 import com.unifieddataprocessing.pubsub.relay.DataRelayConfig;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
 
 DataRelayConfig cfg = DataRelayConfig.builder().build(); // sensible defaults
 
@@ -456,7 +458,7 @@ PubSubPublisher pulsarPublisher = new PulsarPublisher(
 PubSubConsumer kinesisSideConsumer = new KafkaConsumer(
     new KafkaConsumerConfig("kafka:9092", "relay-kinesis-shopify"));
 PubSubPublisher kinesisPublisher = new KinesisPublisher(
-    KinesisPublisherConfig.builder().region("us-east-1").build());
+    new KinesisPublisherConfig(Region.US_EAST_1, DefaultCredentialsProvider.create()));
 
 try (DataRelay relay = new DataRelay(cfg)) {
   relay.register(
