@@ -490,12 +490,18 @@ try (DataRelay relay = new DataRelay(cfg)) {
      successfully-published records that would become duplicates after
      restart.
    - If the consumer's **`acknowledge(...)`** throws (e.g. transient Kafka
-     `commitSync` during a rebalance, GCP ack-RPC), the relay logs, sleeps
-     `pollBackoff`, and breaks the batch — the next `poll()` lets the
-     consumer make state-machine progress (in Kafka's case, complete the
-     pending rebalance, which is required before any commit can succeed).
-     Messages that were already published but not yet acked may be
-     redelivered and re-published as duplicates (acceptable under
+     `commitSync` during a rebalance, GCP ack-RPC), the relay logs and
+     continues processing the rest of the in-memory batch — every
+     remaining entry is already in our hands and any consumer wrapper that
+     tracks delivered offsets has already advanced past them, so dropping
+     them would block the commit watermark until restart. After the batch
+     ends, the outer poll loop runs `poll(...)`, which lets the consumer
+     make state-machine progress (in Kafka's case, complete the pending
+     rebalance, which is required before any commit can succeed).
+     `pollBackoff` is slept exactly once per batch so a burst of transient
+     ack failures during the same rebalance doesn't amplify backoff by
+     batch size. Messages that were already published but not yet acked
+     may be redelivered and re-published as duplicates (acceptable under
      at-least-once). A transient ack failure no longer silently kills the
      worker.
 2. **Layered provenance.** The relay stamps `relay.destinationId`,

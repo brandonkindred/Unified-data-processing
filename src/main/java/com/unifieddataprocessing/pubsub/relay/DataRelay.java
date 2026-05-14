@@ -324,6 +324,7 @@ public final class DataRelay implements AutoCloseable {
   }
 
   private boolean processBatch(RelayRegistration reg, List<Message> batch) {
+    boolean ackFailureSeen = false;
     for (Message m : batch) {
       if (state != State.Running) {
         return true;
@@ -339,10 +340,23 @@ public final class DataRelay implements AutoCloseable {
       if (outcome == AckOutcome.EXIT) {
         return false;
       }
-      if (outcome == AckOutcome.BREAK_BATCH) {
-        // Let the outer poll loop call poll(...) again — this gives e.g. KafkaConsumer the chance
-        // to complete a pending rebalance, which is required before commitSync can succeed.
-        return true;
+      if (outcome == AckOutcome.FAILURE) {
+        // Continue processing the rest of the batch — every entry is already in our hands and
+        // any consumer wrapper that tracks delivered offsets (e.g. the project's KafkaConsumer)
+        // has already marked them delivered, so dropping them here would block the commit
+        // watermark until restart. The outer poll loop will run poll(...) after this batch,
+        // which is what lets e.g. a Kafka rebalance complete. We sleep pollBackoff exactly
+        // once per batch so a burst of transient ack failures (e.g. during a rebalance) doesn't
+        // amplify backoff by batch size.
+        if (!ackFailureSeen) {
+          ackFailureSeen = true;
+          try {
+            sleeper.sleep(config.pollBackoff());
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+          }
+        }
       }
     }
     return true;
@@ -359,6 +373,12 @@ public final class DataRelay implements AutoCloseable {
    * internally (e.g. the project's Kafka consumer wrapper) would otherwise advance past the failed
    * message on the next {@code poll()}, stranding it until rebalance/restart and turning every
    * later record into a duplicate after recovery.
+   *
+   * <p>Catches {@link RuntimeException} alongside {@link ExecutionException} /
+   * {@link TimeoutException} so that publishers that throw synchronously from {@code publish(...)}
+   * (instead of returning an exceptionally-completed future) or that hand back a cancelled future
+   * (whose {@code get()} throws {@link java.util.concurrent.CancellationException}) don't bypass
+   * the retry path and silently kill the worker.
    */
   private boolean publishWithRetry(RelayRegistration reg, Message rewritten) {
     while (state == State.Running) {
@@ -370,7 +390,7 @@ public final class DataRelay implements AutoCloseable {
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
         return false;
-      } catch (ExecutionException | TimeoutException e) {
+      } catch (ExecutionException | TimeoutException | RuntimeException e) {
         LOG.log(
             Level.WARNING,
             "publish failed for "
@@ -393,24 +413,23 @@ public final class DataRelay implements AutoCloseable {
   /** Outcome of a single ack attempt; see {@link #tryAcknowledgeOnce}. */
   private enum AckOutcome {
     SUCCESS,
-    BREAK_BATCH,
+    FAILURE,
     EXIT
   }
 
   /**
    * Acknowledges a successfully-published message on the source consumer with a single attempt.
    * Returns {@link AckOutcome#SUCCESS} on success, {@link AckOutcome#EXIT} if the worker was
-   * interrupted while sleeping, or {@link AckOutcome#BREAK_BATCH} on any other ack failure (after
-   * logging and a {@code pollBackoff} sleep).
+   * interrupted, or {@link AckOutcome#FAILURE} on any other ack failure (after logging).
    *
-   * <p>Why one attempt + break batch instead of retry-in-place: ack failures from
-   * {@code KafkaConsumer.commitSync()} during a rebalance cannot be cleared by sleeping and
-   * retrying the same commit — the consumer must call {@code poll(...)} again to drive the
-   * rebalance to completion before any commit can succeed. Retrying the same ack in a tight loop
-   * would stall the registration forever after a downstream publish has already succeeded.
-   * Breaking the batch hands control back to {@link #pollLoopForever}, whose next {@code poll()}
-   * lets the consumer make state-machine progress; any messages already published but not yet
-   * acked may be redelivered and re-published as duplicates (acceptable under at-least-once).
+   * <p>Why a single attempt + continue-batch instead of retry-in-place: ack failures from
+   * {@code KafkaConsumer.commitSync()} during a rebalance cannot be cleared by retrying the same
+   * commit in a tight loop — the consumer must call {@code poll(...)} again to drive the
+   * rebalance to completion before any commit can succeed. {@link #processBatch} therefore keeps
+   * processing the rest of the polled batch (every entry is already in our hands) and lets the
+   * outer poll loop call {@code poll(...)} after the batch ends; that next poll is what lets the
+   * consumer make state-machine progress. Messages already published but not yet acked may be
+   * redelivered and re-published as duplicates (acceptable under at-least-once).
    */
   private AckOutcome tryAcknowledgeOnce(RelayRegistration reg, Message m) {
     try {
@@ -423,15 +442,10 @@ public final class DataRelay implements AutoCloseable {
               + reg.destinationId()
               + "/"
               + reg.sourceTopic()
-              + "; breaking batch so the next poll() can recover (e.g. complete a Kafka rebalance)",
+              + "; continuing batch, next poll() will let the consumer recover"
+              + " (e.g. complete a Kafka rebalance)",
           e);
-      try {
-        sleeper.sleep(config.pollBackoff());
-      } catch (InterruptedException sleepInterrupt) {
-        Thread.currentThread().interrupt();
-        return AckOutcome.EXIT;
-      }
-      return AckOutcome.BREAK_BATCH;
+      return AckOutcome.FAILURE;
     }
   }
 

@@ -330,13 +330,13 @@ class DataRelayTest {
   }
 
   @Test
-  void acknowledgeFails_breaksBatchAndRecoversOnNextPoll_workerStaysAlive() throws Exception {
-    // ack failures (e.g. KafkaConsumer.commitSync during rebalance) cannot be retried in place —
-    // the consumer must poll() again to drive its state machine forward (e.g. complete the
-    // rebalance) before any commit can succeed. The relay must therefore log + sleep
-    // pollBackoff + break the batch on ack failure, NOT loop forever on the same ack.
+  void acknowledgeFails_recoversOnNextPoll_workerStaysAlive() throws Exception {
+    // ack failures (e.g. KafkaConsumer.commitSync during rebalance) cannot be cleared by an
+    // in-place retry — the consumer must poll() again to drive its state machine forward
+    // (e.g. complete the rebalance) before any commit can succeed. After processing the rest of
+    // the batch, the outer poll loop runs poll() which is what unblocks the consumer.
     Message m1 = msg("m-1", "shopify.orders", Map.of());
-    // First poll: deliver m1 → publish succeeds → ack throws → batch breaks.
+    // First poll: deliver m1 → publish succeeds → ack throws → batch ends (1 msg) → poll again.
     // Second poll: simulate redelivery (Kafka would re-deliver after rebalance) → ack succeeds.
     when(consumerA.poll(any(Duration.class)))
         .thenReturn(List.of(m1))
@@ -373,7 +373,141 @@ class DataRelayTest {
     verify(consumerA, atLeast(2)).poll(any(Duration.class));
     // Two ack attempts total: first throws, second (after re-poll) succeeds.
     verify(consumerA, times(2)).acknowledge(any(Message.class));
-    // Exactly one backoff sleep, after the failed ack.
+    // Exactly one backoff sleep, after the failed ack in the first batch.
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void acknowledgeFails_continuesProcessingRestOfBatch() throws Exception {
+    // Multi-message batch where ack(m1) throws — the relay must still publish AND attempt to
+    // ack m2 and m3, because they're already in our hands and any consumer wrapper that tracks
+    // delivered offsets has already advanced past them. Dropping them would block the commit
+    // watermark until restart. pollBackoff is slept exactly once for the whole batch, regardless
+    // of how many acks in the batch fail.
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    Message m2 = msg("m-2", "shopify.orders", Map.of());
+    Message m3 = msg("m-3", "shopify.orders", Map.of());
+    CountDownLatch batchDone = new CountDownLatch(1);
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1, m2, m3))
+        .thenAnswer(
+            inv -> {
+              batchDone.countDown();
+              return List.of();
+            });
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    AtomicInteger ackAttempts = new AtomicInteger();
+    doAnswer(
+            inv -> {
+              int n = ackAttempts.incrementAndGet();
+              if (n == 1) {
+                // ack(m1) fails — m2 and m3 must still be published + ack-attempted.
+                throw new RuntimeException("transient commit failure");
+              }
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(batchDone.await(2, TimeUnit.SECONDS), "the batch should finish");
+    relay.close();
+
+    // All three messages must have been published, even though ack(m1) failed mid-batch.
+    verify(publisherA, times(3)).publish(any(Message.class));
+    // All three acks must have been attempted (m1 throws, m2 and m3 succeed).
+    verify(consumerA, times(3)).acknowledge(any(Message.class));
+    // Exactly one pollBackoff sleep — not three. Batch-size amplification is forbidden.
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void publishThrowsSynchronously_retriesAndRecovers_workerStaysAlive() throws Exception {
+    // A misbehaving publisher that throws synchronously from publish(...) (instead of returning
+    // an exceptionally-completed future) must NOT kill the worker — publishWithRetry must catch
+    // the unchecked exception and back off / retry.
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of());
+
+    AtomicInteger publishAttempts = new AtomicInteger();
+    when(publisherA.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              int n = publishAttempts.incrementAndGet();
+              if (n == 1) {
+                throw new RuntimeException("synchronous publish failure");
+              }
+              return CompletableFuture.completedFuture(null);
+            });
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "ack should succeed after publish retry");
+    assertTrue(relay.isRunning(), "worker must still be alive after sync publish throw");
+    relay.close();
+
+    verify(publisherA, times(2)).publish(any(Message.class));
+    verify(consumerA, times(1)).acknowledge(any(Message.class));
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void publishReturnsCancelledFuture_retriesAndRecovers_workerStaysAlive() throws Exception {
+    // A cancelled CompletableFuture's get() throws CancellationException (RuntimeException).
+    // publishWithRetry must catch it just like ExecutionException / TimeoutException, otherwise
+    // the worker dies silently.
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of());
+
+    CompletableFuture<PublishResult> cancelled = new CompletableFuture<>();
+    cancelled.cancel(true);
+    AtomicInteger publishAttempts = new AtomicInteger();
+    when(publisherA.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              int n = publishAttempts.incrementAndGet();
+              return n == 1 ? cancelled : CompletableFuture.completedFuture(null);
+            });
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "ack should succeed after cancelled retry");
+    assertTrue(relay.isRunning(), "worker must still be alive after CancellationException");
+    relay.close();
+
+    verify(publisherA, times(2)).publish(any(Message.class));
+    verify(consumerA, times(1)).acknowledge(any(Message.class));
     assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
   }
 
