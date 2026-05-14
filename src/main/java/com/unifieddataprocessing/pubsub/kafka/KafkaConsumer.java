@@ -187,6 +187,30 @@ public class KafkaConsumer implements PubSubConsumer {
       consumer.commitSync(Collections.singletonMap(tp, new OffsetAndMetadata(commitOffset)));
       delivered.headSet(highestAckedDelivered, true).clear();
       acked.headSet(highestAckedDelivered, true).clear();
+      // Sweep the id-keyed side maps for any messages whose (partition, offset) just got
+      // committed. A previous acknowledge(m_earlier) whose commitSync threw (e.g. during a
+      // rebalance) leaves m_earlier's entries in partitionByMessageId / offsetByMessageId — the
+      // throw bypasses the remove() calls below. If a successor on the same partition later
+      // commits past m_earlier's offset (as we just did), those entries would leak forever
+      // without this sweep. Linear in the number of in-flight (delivered-but-unacked) message
+      // ids, which is bounded by the consumer's poll batch size.
+      long committedThrough = highestAckedDelivered;
+      offsetByMessageId
+          .entrySet()
+          .removeIf(
+              e -> {
+                String id = e.getKey();
+                Long off = e.getValue();
+                TopicPartition entryTp = partitionByMessageId.get(id);
+                if (entryTp != null
+                    && entryTp.equals(tp)
+                    && off != null
+                    && off <= committedThrough) {
+                  partitionByMessageId.remove(id);
+                  return true;
+                }
+                return false;
+              });
     }
 
     partitionByMessageId.remove(message.getId());

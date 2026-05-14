@@ -1,0 +1,1033 @@
+package com.unifieddataprocessing.pubsub.relay;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.atLeast;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.unifieddataprocessing.pubsub.Message;
+import com.unifieddataprocessing.pubsub.PubSubConsumer;
+import com.unifieddataprocessing.pubsub.PubSubPublisher;
+import com.unifieddataprocessing.pubsub.PublishResult;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+@ExtendWith(MockitoExtension.class)
+class DataRelayTest {
+
+  @Mock private PubSubConsumer consumerA;
+  @Mock private PubSubConsumer consumerB;
+  @Mock private PubSubPublisher publisherA;
+  @Mock private PubSubPublisher publisherB;
+
+  private Function<Integer, ExecutorService> singleThreadFactory;
+  private Sleeper noopSleeper;
+  private DataRelayConfig config;
+
+  @BeforeEach
+  void setUp() {
+    singleThreadFactory = n -> Executors.newSingleThreadExecutor();
+    noopSleeper = d -> {};
+    config =
+        DataRelayConfig.builder()
+            .pollTimeout(Duration.ofMillis(50))
+            .publishTimeout(Duration.ofMillis(500))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .build();
+  }
+
+  private DataRelay newRelay() {
+    return new DataRelay(config, singleThreadFactory, noopSleeper);
+  }
+
+  private DataRelay newRelay(Sleeper sleeper) {
+    return new DataRelay(config, singleThreadFactory, sleeper);
+  }
+
+  /** Records every {@link Sleeper#sleep(Duration)} invocation; thread-safe for worker threads. */
+  static final class CountingSleeper implements Sleeper {
+    final List<Duration> sleeps = Collections.synchronizedList(new ArrayList<>());
+
+    @Override
+    public void sleep(Duration d) {
+      sleeps.add(d);
+    }
+  }
+
+  private static Message msg(String id, String topic, Map<String, String> attrs) {
+    return new Message(id, topic, new byte[] {1, 2, 3}, attrs);
+  }
+
+  @Test
+  void happyPath_connectsSubscribesPublishesAcksInOrder() throws Exception {
+    Message source = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(source))
+        .thenReturn(List.of());
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "consumerA should have acked the message");
+    relay.close();
+
+    InOrder order = inOrder(publisherA, consumerA);
+    order.verify(publisherA).connect();
+    order.verify(consumerA).connect();
+    order.verify(consumerA).subscribe("shopify.orders");
+    order.verify(consumerA).poll(any(Duration.class));
+    order.verify(publisherA).publish(any(Message.class));
+    order.verify(consumerA).acknowledge(any(Message.class));
+  }
+
+  @Test
+  void happyPath_rewrittenMessageHasDownstreamTopicAndRelayAttrs() throws Exception {
+    Map<String, String> callerAttrs = new LinkedHashMap<>();
+    callerAttrs.put(RelayAttributes.RELAY_DESTINATION_ID, "wrong");
+    callerAttrs.put("bridge.sourceId", "shopify"); // preserved from inbound bridge
+    callerAttrs.put("kafkaKey", "k-1");
+    Message source = msg("m-1", "shopify.orders", callerAttrs);
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(source))
+        .thenReturn(List.of());
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS));
+    relay.close();
+
+    ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
+    verify(publisherA).publish(captor.capture());
+    Message published = captor.getValue();
+    assertEquals("orders_q", published.getTopic());
+    assertEquals(
+        "rabbit-prod", published.getAttributes().get(RelayAttributes.RELAY_DESTINATION_ID));
+    assertEquals(
+        "shopify.orders", published.getAttributes().get(RelayAttributes.RELAY_SOURCE_TOPIC));
+    assertEquals(
+        "orders_q", published.getAttributes().get(RelayAttributes.RELAY_DOWNSTREAM_TOPIC));
+    assertEquals("shopify", published.getAttributes().get("bridge.sourceId"));
+    assertEquals("k-1", published.getAttributes().get("kafkaKey"));
+    assertEquals("m-1", published.getId());
+  }
+
+  @Test
+  void twoDestinations_eachPublishedAndAcked() throws Exception {
+    Message messageA = msg("m-A", "shopify.orders", Map.of());
+    Message messageB = msg("m-B", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class))).thenReturn(List.of(messageA)).thenReturn(List.of());
+    when(consumerB.poll(any(Duration.class))).thenReturn(List.of(messageB)).thenReturn(List.of());
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+    when(publisherB.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(2);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerB)
+        .acknowledge(any(Message.class));
+
+    // Override the test default (single-thread) so two poll loops can run concurrently.
+    singleThreadFactory = n -> Executors.newFixedThreadPool(n);
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.orders", "orders-topic", consumerB, publisherB);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "both registrations should have acked");
+    relay.close();
+
+    ArgumentCaptor<Message> captorA = ArgumentCaptor.forClass(Message.class);
+    ArgumentCaptor<Message> captorB = ArgumentCaptor.forClass(Message.class);
+    verify(publisherA).publish(captorA.capture());
+    verify(publisherB).publish(captorB.capture());
+    Set<String> publishedTopics =
+        List.of(captorA.getValue(), captorB.getValue()).stream()
+            .map(Message::getTopic)
+            .collect(Collectors.toSet());
+    assertEquals(Set.of("orders_q", "orders-topic"), publishedTopics);
+  }
+
+  @Test
+  void pollThrowsThenRecovers() throws Exception {
+    Message source = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenThrow(new RuntimeException("transient poll error"))
+        .thenReturn(List.of(source))
+        .thenReturn(List.of());
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "consumerA should ack after poll recovers");
+    relay.close();
+
+    verify(publisherA, times(1)).publish(any(Message.class));
+    verify(consumerA, times(1)).acknowledge(any(Message.class));
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void publishTimesOut_pausesAndRetriesSameMessage_noFurtherPoll() throws Exception {
+    // Shorten publishTimeout so the timed-out get() returns quickly.
+    config =
+        DataRelayConfig.builder()
+            .pollTimeout(Duration.ofMillis(50))
+            .publishTimeout(Duration.ofMillis(100))
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .build();
+
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    Message m2 = msg("m-2", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1, m2))
+        .thenReturn(List.of());
+
+    // First publish never completes (TimeoutException); subsequent calls succeed.
+    // The relay should retry the SAME message (m1) without polling again, then publish m2.
+    CompletableFuture<PublishResult> neverCompletes = new CompletableFuture<>();
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(neverCompletes)
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(2);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(3, TimeUnit.SECONDS), "both messages should ack after retry");
+    relay.close();
+
+    // 3 publishes: m1 timeout + m1 retry-success + m2 success. 2 acks.
+    verify(publisherA, times(3)).publish(any(Message.class));
+    verify(consumerA, times(2)).acknowledge(any(Message.class));
+    // Exactly one backoff sleep, for the single publish failure.
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void publishFails_pausesAndRetriesSameMessage_noFurtherPoll() throws Exception {
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    Message m2 = msg("m-2", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1, m2))
+        .thenReturn(List.of());
+
+    CompletableFuture<PublishResult> failed = new CompletableFuture<>();
+    failed.completeExceptionally(new RuntimeException("publish-fail"));
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(failed)
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(2);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(3, TimeUnit.SECONDS), "both messages should ack after retry");
+    relay.close();
+
+    verify(publisherA, times(3)).publish(any(Message.class));
+    verify(consumerA, times(2)).acknowledge(any(Message.class));
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void acknowledgeFails_recoversOnNextPoll_workerStaysAlive() throws Exception {
+    // ack failures (e.g. KafkaConsumer.commitSync during rebalance) cannot be cleared by an
+    // in-place retry — the consumer must poll() again to drive its state machine forward
+    // (e.g. complete the rebalance) before any commit can succeed. After processing the rest of
+    // the batch, the outer poll loop runs poll() which is what unblocks the consumer.
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    // First poll: deliver m1 → publish succeeds → ack throws → batch ends (1 msg) → poll again.
+    // Second poll: simulate redelivery (Kafka would re-deliver after rebalance) → ack succeeds.
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of());
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch successAckLatch = new CountDownLatch(1);
+    AtomicInteger ackAttempts = new AtomicInteger();
+    doAnswer(
+            inv -> {
+              int n = ackAttempts.incrementAndGet();
+              if (n == 1) {
+                throw new RuntimeException("transient commit failure (rebalance)");
+              }
+              successAckLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(
+        successAckLatch.await(2, TimeUnit.SECONDS),
+        "ack should succeed on the second poll's redelivery, not via in-place retry");
+    assertTrue(relay.isRunning(), "worker should still be alive after transient ack failure");
+    relay.close();
+
+    // The relay must have re-polled (>= 2 polls) rather than spin-retrying the same ack.
+    verify(consumerA, atLeast(2)).poll(any(Duration.class));
+    // Two ack attempts total: first throws, second (after re-poll) succeeds.
+    verify(consumerA, times(2)).acknowledge(any(Message.class));
+    // Exactly one backoff sleep, after the failed ack in the first batch.
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void acknowledgeFails_continuesProcessingRestOfBatch() throws Exception {
+    // Multi-message batch where ack(m1) throws — the relay must still publish AND attempt to
+    // ack m2 and m3, because they're already in our hands and any consumer wrapper that tracks
+    // delivered offsets has already advanced past them. Dropping them would block the commit
+    // watermark until restart. pollBackoff is slept exactly once for the whole batch, regardless
+    // of how many acks in the batch fail.
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    Message m2 = msg("m-2", "shopify.orders", Map.of());
+    Message m3 = msg("m-3", "shopify.orders", Map.of());
+    CountDownLatch batchDone = new CountDownLatch(1);
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1, m2, m3))
+        .thenAnswer(
+            inv -> {
+              batchDone.countDown();
+              return List.of();
+            });
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    AtomicInteger ackAttempts = new AtomicInteger();
+    doAnswer(
+            inv -> {
+              int n = ackAttempts.incrementAndGet();
+              if (n == 1) {
+                // ack(m1) fails — m2 and m3 must still be published + ack-attempted.
+                throw new RuntimeException("transient commit failure");
+              }
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(batchDone.await(2, TimeUnit.SECONDS), "the batch should finish");
+    relay.close();
+
+    // All three messages must have been published, even though ack(m1) failed mid-batch.
+    verify(publisherA, times(3)).publish(any(Message.class));
+    // All three acks must have been attempted (m1 throws, m2 and m3 succeed).
+    verify(consumerA, times(3)).acknowledge(any(Message.class));
+    // Exactly one pollBackoff sleep — not three. Batch-size amplification is forbidden.
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void publishThrowsSynchronously_retriesAndRecovers_workerStaysAlive() throws Exception {
+    // A misbehaving publisher that throws synchronously from publish(...) (instead of returning
+    // an exceptionally-completed future) must NOT kill the worker — publishWithRetry must catch
+    // the unchecked exception and back off / retry.
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of());
+
+    AtomicInteger publishAttempts = new AtomicInteger();
+    when(publisherA.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              int n = publishAttempts.incrementAndGet();
+              if (n == 1) {
+                throw new RuntimeException("synchronous publish failure");
+              }
+              return CompletableFuture.completedFuture(null);
+            });
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "ack should succeed after publish retry");
+    assertTrue(relay.isRunning(), "worker must still be alive after sync publish throw");
+    relay.close();
+
+    verify(publisherA, times(2)).publish(any(Message.class));
+    verify(consumerA, times(1)).acknowledge(any(Message.class));
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void publishReturnsCancelledFuture_retriesAndRecovers_workerStaysAlive() throws Exception {
+    // A cancelled CompletableFuture's get() throws CancellationException (RuntimeException).
+    // publishWithRetry must catch it just like ExecutionException / TimeoutException, otherwise
+    // the worker dies silently.
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of());
+
+    CompletableFuture<PublishResult> cancelled = new CompletableFuture<>();
+    cancelled.cancel(true);
+    AtomicInteger publishAttempts = new AtomicInteger();
+    when(publisherA.publish(any(Message.class)))
+        .thenAnswer(
+            inv -> {
+              int n = publishAttempts.incrementAndGet();
+              return n == 1 ? cancelled : CompletableFuture.completedFuture(null);
+            });
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS), "ack should succeed after cancelled retry");
+    assertTrue(relay.isRunning(), "worker must still be alive after CancellationException");
+    relay.close();
+
+    verify(publisherA, times(2)).publish(any(Message.class));
+    verify(consumerA, times(1)).acknowledge(any(Message.class));
+    assertEquals(List.of(config.pollBackoff()), sleeper.sleeps);
+  }
+
+  @Test
+  void publishTimeout_subMillisecond_preservesNanosecondBudget() throws Exception {
+    // A 500us publishTimeout that previously got truncated to 0ms by .toMillis() would have made
+    // every Future.get(0, MILLISECONDS) an immediate non-blocking check, timing out every async
+    // publish and looping forever. With nanosecond-precision get(), a future that completes
+    // within ~500us must be observed as successful, not as a TimeoutException.
+    config =
+        DataRelayConfig.builder()
+            .pollTimeout(Duration.ofMillis(50))
+            .publishTimeout(Duration.ofNanos(500_000)) // 0.5 ms — under the 1 ms toMillis() floor
+            .shutdownTimeout(Duration.ofMillis(500))
+            .closeForceTimeout(Duration.ofMillis(200))
+            .pollBackoff(Duration.ofMillis(50))
+            .build();
+
+    Message m1 = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m1))
+        .thenReturn(List.of());
+    // Future completes IMMEDIATELY (so well within the 0.5ms budget). With the old toMillis()
+    // implementation, get(0, MS) raced the immediate completion and could even succeed by luck;
+    // we instead pin the assertion to "no retry / no backoff sleep" to prove the budget didn't
+    // get truncated to zero.
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS));
+    relay.close();
+
+    // Exactly one publish + one ack. No pollBackoff sleep — proves we didn't treat the publish as
+    // a timeout and re-enter the retry path.
+    verify(publisherA, times(1)).publish(any(Message.class));
+    verify(consumerA, times(1)).acknowledge(any(Message.class));
+    assertTrue(
+        sleeper.sleeps.isEmpty(),
+        "no backoff sleep expected; got " + sleeper.sleeps);
+  }
+
+  @Test
+  void failingDestinationDoesNotBlockHealthyDestination() throws Exception {
+    AtomicInteger counter = new AtomicInteger();
+    when(consumerA.poll(any(Duration.class)))
+        .thenAnswer(
+            inv -> List.of(msg("a-" + counter.incrementAndGet(), "shopify.orders", Map.of())));
+    when(consumerB.poll(any(Duration.class)))
+        .thenAnswer(
+            inv -> {
+              throw new RuntimeException("destination-b consumer broken");
+            });
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    CountDownLatch ackLatch = new CountDownLatch(3);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    // Real two-thread pool so the failing registration can't starve the healthy one.
+    singleThreadFactory = n -> Executors.newFixedThreadPool(n);
+
+    CountingSleeper sleeper = new CountingSleeper();
+    DataRelay relay = newRelay(sleeper);
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.orders", "orders-topic", consumerB, publisherB);
+    relay.start();
+    assertTrue(ackLatch.await(5, TimeUnit.SECONDS), "destination A should ack >= 3 times");
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+    while (sleeper.sleeps.isEmpty() && System.nanoTime() < deadline) {
+      Thread.sleep(10);
+    }
+
+    long t0 = System.nanoTime();
+    relay.close();
+    long elapsedNs = System.nanoTime() - t0;
+
+    verify(consumerA, atLeast(3)).acknowledge(any(Message.class));
+    assertTrue(
+        sleeper.sleeps.size() >= 1,
+        "destination B's poll failures should have triggered at least one backoff sleep");
+
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofMillis(500));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() took " + Duration.ofNanos(elapsedNs) + " but budget is " + budget);
+  }
+
+  @Test
+  void register_afterStart_throwsIllegalStateException() {
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertTrue(relay.isRunning());
+
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            relay.register(
+                "pulsar-prod", "shopify.orders", "orders-topic", consumerB, publisherB));
+
+    relay.close();
+  }
+
+  @Test
+  void register_duplicateDestinationIdSourceTopicPair_throwsIllegalArgumentException() {
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            relay.register(
+                "rabbit-prod", "shopify.orders", "orders_q_2", consumerB, publisherB));
+  }
+
+  @Test
+  void register_sameSourceTopic_differentDestination_accepted() {
+    // Fan-out: one Kafka topic relayed to two different destinations.
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.orders", "orders-topic", consumerB, publisherB);
+  }
+
+  @Test
+  void register_duplicateConsumerInstance_throwsIllegalArgumentException() {
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            relay.register(
+                "pulsar-prod", "shopify.payments", "payments-topic", consumerA, publisherB));
+  }
+
+  @Test
+  void register_duplicatePublisherInstance_throwsIllegalArgumentException() {
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            relay.register(
+                "pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherA));
+  }
+
+  @Test
+  void register_invalidDestinationId_throwsIllegalArgumentException() {
+    DataRelay relay = newRelay();
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            relay.register("rabbit.prod", "shopify.orders", "orders_q", consumerA, publisherA));
+  }
+
+  @Test
+  void start_twice_throwsIllegalStateException() {
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    assertThrows(IllegalStateException.class, relay::start);
+    relay.close();
+  }
+
+  @Test
+  void start_withNoRegistrations_throwsIllegalStateException() {
+    DataRelay relay = newRelay();
+    assertThrows(IllegalStateException.class, relay::start);
+  }
+
+  @Test
+  void start_subscribeFailure_cleansUpConnectedConsumersAndPublishers_stateClosed() {
+    doThrow(new RuntimeException("subscribe boom")).when(consumerB).subscribe("shopify.payments");
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+
+    assertThrows(RuntimeException.class, relay::start);
+    assertFalse(relay.isRunning());
+
+    relay.close();
+
+    // Both publishers connect first; both consumers connect; consumerB's subscribe throws.
+    verify(publisherA).connect();
+    verify(publisherB).connect();
+    verify(consumerA).connect();
+    verify(consumerB).connect();
+    verify(consumerA, times(1)).close();
+    verify(consumerB, times(1)).close();
+    verify(publisherA, times(1)).close();
+    verify(publisherB, times(1)).close();
+  }
+
+  @Test
+  void start_publisherConnectFailure_doesNotConnectConsumers_stateClosed() {
+    doThrow(new RuntimeException("publisher connect boom")).when(publisherB).connect();
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+
+    assertThrows(RuntimeException.class, relay::start);
+    assertFalse(relay.isRunning());
+
+    relay.close();
+
+    // publisherA connected successfully before publisherB failed; no consumers ever connected.
+    verify(publisherA).connect();
+    verify(publisherB).connect();
+    verify(consumerA, never()).connect();
+    verify(consumerB, never()).connect();
+    verify(publisherA, times(1)).close();
+    verify(publisherB, never()).close();
+  }
+
+  @Test
+  void start_failureAfterWorkersSubmitted_flipsStateAndAwaitsBeforeClosingClients()
+      throws Exception {
+    // Force the 2nd executor.submit() to reject so cleanupAfterFailedStart runs while at least
+    // one worker has already been submitted. The cleanup must:
+    //   1. Flip state to Closed *before* closing clients, so any worker still in poll()/publish()
+    //      sees state != Running on its next check and exits without touching closed clients.
+    //   2. Await executor termination (with closeForceTimeout) before closing the consumers and
+    //      publishers those workers may still be calling into.
+    ExecutorService rejectingExec = mock(ExecutorService.class);
+    AtomicInteger submitCount = new AtomicInteger();
+    when(rejectingExec.submit(any(Runnable.class)))
+        .thenAnswer(
+            inv -> {
+              if (submitCount.incrementAndGet() >= 2) {
+                throw new RejectedExecutionException("simulated reject on second submit");
+              }
+              return null;
+            });
+    when(rejectingExec.awaitTermination(anyLong(), any())).thenReturn(true);
+    singleThreadFactory = n -> rejectingExec;
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+
+    // Snapshot relay.isRunning() at the moment each client is closed by cleanup.
+    AtomicBoolean consumerCloseSawRunning = new AtomicBoolean();
+    AtomicBoolean publisherCloseSawRunning = new AtomicBoolean();
+    doAnswer(
+            inv -> {
+              consumerCloseSawRunning.set(relay.isRunning());
+              return null;
+            })
+        .when(consumerA)
+        .close();
+    doAnswer(
+            inv -> {
+              publisherCloseSawRunning.set(relay.isRunning());
+              return null;
+            })
+        .when(publisherA)
+        .close();
+
+    assertThrows(RuntimeException.class, relay::start);
+    assertFalse(relay.isRunning());
+
+    // State must have been flipped to Closed before clients were closed.
+    assertFalse(
+        consumerCloseSawRunning.get(),
+        "state must flip to Closed before consumer.close() during failed-start cleanup");
+    assertFalse(
+        publisherCloseSawRunning.get(),
+        "state must flip to Closed before publisher.close() during failed-start cleanup");
+
+    // Cleanup must shut down the executor AND await termination before touching the clients.
+    InOrder order = inOrder(rejectingExec, consumerA, publisherA);
+    order.verify(rejectingExec).shutdownNow();
+    order.verify(rejectingExec).awaitTermination(anyLong(), any());
+    order.verify(consumerA).close();
+    order.verify(publisherA).close();
+  }
+
+  @Test
+  void close_flushesEveryPublisherBeforeClosingThem() {
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+    lenient().when(consumerB.poll(any(Duration.class))).thenReturn(List.of());
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+    relay.start();
+    relay.close();
+
+    InOrder orderA = inOrder(publisherA);
+    orderA.verify(publisherA).flush();
+    orderA.verify(publisherA).close();
+
+    InOrder orderB = inOrder(publisherB);
+    orderB.verify(publisherB).flush();
+    orderB.verify(publisherB).close();
+  }
+
+  @Test
+  void close_tolerates_publisherThatThrowsOnFlush() throws Exception {
+    doThrow(new RuntimeException("flush boom")).when(publisherA).flush();
+    Message m = msg("m-1", "shopify.orders", Map.of());
+    when(consumerA.poll(any(Duration.class)))
+        .thenReturn(List.of(m))
+        .thenReturn(List.of());
+    when(publisherA.publish(any(Message.class)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+    lenient().when(consumerB.poll(any(Duration.class))).thenReturn(List.of());
+
+    CountDownLatch ackLatch = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              ackLatch.countDown();
+              return null;
+            })
+        .when(consumerA)
+        .acknowledge(any(Message.class));
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+    relay.start();
+    assertTrue(ackLatch.await(2, TimeUnit.SECONDS));
+    relay.close();
+
+    verify(consumerA).close();
+    verify(consumerB).close();
+    verify(publisherA).close();
+    verify(publisherB).close();
+  }
+
+  @Test
+  void close_boundsFlushPhaseAgainstCloseForceTimeout() throws Exception {
+    // publisherA.flush() blocks forever (latch never decremented); close() must still return
+    // within the relay's declared budget instead of stalling on the publisher.
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+    lenient().when(consumerB.poll(any(Duration.class))).thenReturn(List.of());
+
+    CountDownLatch flushReleaser = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              flushReleaser.await(60, TimeUnit.SECONDS);
+              return null;
+            })
+        .when(publisherA)
+        .flush();
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+    relay.start();
+
+    long t0 = System.nanoTime();
+    relay.close();
+    long elapsedNs = System.nanoTime() - t0;
+    flushReleaser.countDown(); // release the hung flush so the daemon thread can finish
+
+    // Worst case: shutdownTimeout (executor graceful) + closeForceTimeout (flush phase) + grace.
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofMillis(500));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() took " + Duration.ofNanos(elapsedNs) + " but budget is " + budget);
+
+    // close() on publishers and consumers is still attempted (best-effort), even after the
+    // hanging flush is abandoned.
+    verify(publisherA).close();
+    verify(publisherB).close();
+    verify(consumerA).close();
+    verify(consumerB).close();
+  }
+
+  @Test
+  void close_stuckFlushOnA_doesNotBlockFlushOnB() throws Exception {
+    // publisherA.flush() hangs (and would ignore Thread.interrupt() — the latch only releases
+    // when the test releases it). publisherB.flush() must still get a fair shot at the remaining
+    // budget despite A holding onto its own flush thread.
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+    lenient().when(consumerB.poll(any(Duration.class))).thenReturn(List.of());
+
+    CountDownLatch flushReleaser = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              // Loop on a non-interruptible await so a Thread.interrupt() is genuinely ignored,
+              // mirroring publishers (GCP/Kinesis) whose flush() doesn't honor interruption.
+              while (!flushReleaser.await(50, TimeUnit.MILLISECONDS)) {
+                // swallow any interrupt status and keep waiting
+                Thread.interrupted();
+              }
+              return null;
+            })
+        .when(publisherA)
+        .flush();
+
+    CountDownLatch flushedB = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              flushedB.countDown();
+              return null;
+            })
+        .when(publisherB)
+        .flush();
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.register("pulsar-prod", "shopify.payments", "payments-topic", consumerB, publisherB);
+    relay.start();
+
+    long t0 = System.nanoTime();
+    relay.close();
+    long elapsedNs = System.nanoTime() - t0;
+    flushReleaser.countDown(); // release the hung flush so the daemon thread can finish
+
+    // Worst case budget: shutdownTimeout + closeForceTimeout + grace.
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofMillis(500));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() took " + Duration.ofNanos(elapsedNs) + " but budget is " + budget);
+
+    // Despite publisherA's flush() ignoring interruption, publisherB.flush() was reached and ran.
+    assertTrue(
+        flushedB.await(1, TimeUnit.SECONDS),
+        "publisherB.flush() should have run despite publisherA.flush() hanging");
+    verify(publisherA).close();
+    verify(publisherB).close();
+  }
+
+  @Test
+  void close_manyHungPublishers_respectsTotalCloseForceTimeout() throws Exception {
+    // 50 registrations all with hung flush() that ignores interruption. Per-flush slice would be
+    // closeForceTimeout / 50; with the prior 1ms floor, total wall time would be ~50 ms in this
+    // small case but inflate dramatically for thousands of registrations. The total-deadline cap
+    // ensures we never exceed closeForceTimeout regardless of N.
+    int n = 50;
+    @SuppressWarnings("unchecked")
+    PubSubConsumer[] consumers = new PubSubConsumer[n];
+    @SuppressWarnings("unchecked")
+    PubSubPublisher[] publishers = new PubSubPublisher[n];
+    CountDownLatch flushReleaser = new CountDownLatch(1);
+    for (int i = 0; i < n; i++) {
+      consumers[i] = mock(PubSubConsumer.class);
+      publishers[i] = mock(PubSubPublisher.class);
+      lenient().when(consumers[i].poll(any(Duration.class))).thenReturn(List.of());
+      // Lenient: the whole point of the test is that the total budget exhausts before every
+      // publisher is reached, so some flush() stubs intentionally go unused.
+      lenient()
+          .doAnswer(
+              inv -> {
+                while (!flushReleaser.await(50, TimeUnit.MILLISECONDS)) {
+                  Thread.interrupted(); // ignore interruption
+                }
+                return null;
+              })
+          .when(publishers[i])
+          .flush();
+    }
+
+    singleThreadFactory = workers -> Executors.newFixedThreadPool(workers);
+    DataRelay relay = newRelay();
+    for (int i = 0; i < n; i++) {
+      relay.register("dest-" + i, "shopify.orders", "topic-" + i, consumers[i], publishers[i]);
+    }
+    relay.start();
+
+    long t0 = System.nanoTime();
+    relay.close();
+    long elapsedNs = System.nanoTime() - t0;
+    flushReleaser.countDown();
+
+    // Total close() must fit shutdownTimeout (executor) + closeForceTimeout (flush phase) + grace.
+    // In particular, the flush phase alone must be bounded by closeForceTimeout, NOT
+    // n * per-flush-slice with a 1ms floor.
+    Duration budget =
+        config.shutdownTimeout().plus(config.closeForceTimeout()).plus(Duration.ofSeconds(1));
+    assertTrue(
+        elapsedNs <= budget.toNanos(),
+        "close() of " + n + " hung publishers took "
+            + Duration.ofNanos(elapsedNs)
+            + " but budget is "
+            + budget);
+  }
+
+  @Test
+  void close_calledTwice_isNoOp() {
+    lenient().when(consumerA.poll(any(Duration.class))).thenReturn(List.of());
+
+    DataRelay relay = newRelay();
+    relay.register("rabbit-prod", "shopify.orders", "orders_q", consumerA, publisherA);
+    relay.start();
+    relay.close();
+    relay.close();
+
+    verify(publisherA, times(1)).close();
+    verify(consumerA, times(1)).close();
+  }
+}

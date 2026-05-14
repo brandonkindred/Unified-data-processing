@@ -16,12 +16,16 @@
 
 A Java 17 library that gives every major streaming/pub-sub system the **same**
 publisher and consumer API, plus a `DataBridge` that fans heterogeneous sources
-into a single Kafka backbone for downstream analytics and AI workloads.
+into a single Kafka backbone — and a symmetric `DataRelay` that fans that Kafka
+backbone back out to heterogeneous destinations — for downstream analytics and
+AI workloads.
 
 > Status: early development. The unified pub/sub adapters for Kafka, Amazon
 > MSK, Apache Pulsar, Google Cloud Pub/Sub, and AWS Kinesis are functional; the
 > `DataBridge` orchestrator runs each registration on its own poll thread with
-> per-channel topic overrides and at-least-once forwarding.
+> per-channel topic overrides and at-least-once forwarding; the `DataRelay`
+> orchestrator runs the symmetric Kafka → external publisher half with the same
+> at-least-once semantics.
 
 ---
 
@@ -35,6 +39,7 @@ into a single Kafka backbone for downstream analytics and AI workloads.
 - [Getting started](#getting-started)
 - [Usage — publisher & consumer](#usage--publisher--consumer)
 - [Usage — DataBridge](#usage--databridge)
+- [Usage — DataRelay](#usage--datarelay)
 - [Building from source](#building-from-source)
 - [Testing](#testing)
 - [Project layout](#project-layout)
@@ -46,7 +51,7 @@ into a single Kafka backbone for downstream analytics and AI workloads.
 ## What it does
 
 Unified-data-processing is a library (no `main()` — you embed it in your
-service) that provides two things:
+service) that provides three things:
 
 1. **A single pub/sub abstraction** — `Message`, `PubSubPublisher`, and
    `PubSubConsumer` — implemented for Apache Kafka, Amazon MSK (Kafka with IAM
@@ -58,10 +63,18 @@ service) that provides two things:
    every source message into that Kafka backbone with provenance attributes
    stamped on. Delivery is at-least-once: a source message is only acked once
    its corresponding Kafka publish has been acknowledged.
+3. **A `DataRelay` orchestrator** — the symmetric inverse of the bridge — that
+   registers any number of `(destinationId, sourceTopic, downstreamTopic)`
+   bindings, polls the unified Kafka backbone via a per-registration consumer,
+   and republishes every message to the registration's downstream broker
+   (Kafka, MSK, Pulsar, GCP Pub/Sub, Kinesis, …) using its `PubSubPublisher`.
+   Delivery is at-least-once with the same shape as the bridge: a backbone
+   message is only acked once the downstream publish has been acknowledged.
 
 The result is a uniform Kafka-shaped firehose of every event in your stack —
 ready to feed warehouses, lakehouses, feature stores, vector stores, and AI
-pipelines.
+pipelines, and to fan back out to any downstream system that needs the same
+events in their native broker.
 
 ## Why it exists
 
@@ -101,6 +114,12 @@ This project exists to:
 - **DataBridge for fan-in.** Stand up a Kafka-backed event lake by registering
   source consumers — the bridge handles topic provisioning, lifecycle, message
   rewriting (provenance attributes), and at-least-once forwarding.
+- **DataRelay for fan-out.** Symmetric inverse of the bridge: register
+  `(destinationId, sourceTopic, downstreamTopic)` bindings and the relay polls
+  the unified Kafka backbone and republishes each message to a downstream
+  broker of any supported type. Same at-least-once guarantee, same per-
+  registration thread-isolation, plus relay provenance attributes layered on
+  top of the bridge's.
 
 ## Supported brokers
 
@@ -131,11 +150,23 @@ flowchart TD
 
     DC["Downstream analytics / AI consumers"]
 
+    DR["<b>DataRelay</b><br/>• owns connect / subscribe / close<br/>• polls each registration<br/>• rewrites attributes (provenance:<br/>&nbsp;&nbsp;RELAY_DESTINATION_ID / _SOURCE_TOPIC / _DOWNSTREAM_TOPIC)<br/>• publishes downstream, then acks the backbone"]
+
+    subgraph Destinations["Destination publishers (any PubSubPublisher)"]
+        DK["Kafka / MSK"]
+        DP["Pulsar / GCP Pub/Sub"]
+        DKi["Kinesis"]
+    end
+
     K --> DB
     P --> DB
     G --> DB
     DB --> KT
     KT --> DC
+    KT --> DR
+    DR --> DK
+    DR --> DP
+    DR --> DKi
 ```
 
 ### Core types
@@ -402,6 +433,122 @@ try (DataBridge bridge = new DataBridge(cfg)) {
 executor (graceful `shutdownTimeout` then forced `closeForceTimeout`), flushes
 the publisher, then closes every consumer and the publisher.
 
+## Usage — DataRelay
+
+`DataRelay` is the symmetric inverse of `DataBridge`: it pulls from the unified
+Kafka backbone and republishes to any number of heterogeneous downstream
+brokers. Each registration is a fully independent pipeline — its own
+`PubSubConsumer` (typically a `KafkaConsumer` subscribed to a backbone topic)
+and its own `PubSubPublisher` (any supported destination broker), running on
+its own poll thread. A slow or failing downstream destination breaks only its
+own batch (without acking, so the backbone redelivers) and never blocks other
+registrations.
+
+```java
+import com.unifieddataprocessing.pubsub.PubSubConsumer;
+import com.unifieddataprocessing.pubsub.PubSubPublisher;
+import com.unifieddataprocessing.pubsub.kafka.KafkaConsumer;
+import com.unifieddataprocessing.pubsub.kafka.KafkaConsumerConfig;
+import com.unifieddataprocessing.pubsub.pulsar.PulsarPublisher;
+import com.unifieddataprocessing.pubsub.pulsar.PulsarPublisherConfig;
+import com.unifieddataprocessing.pubsub.kinesis.KinesisPublisher;
+import com.unifieddataprocessing.pubsub.kinesis.KinesisPublisherConfig;
+import com.unifieddataprocessing.pubsub.relay.DataRelay;
+import com.unifieddataprocessing.pubsub.relay.DataRelayConfig;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+
+DataRelayConfig cfg = DataRelayConfig.builder().build(); // sensible defaults
+
+// One independent consumer + publisher pair per relay registration. Each pair
+// must be freshly constructed — the relay owns connect/subscribe/close.
+PubSubConsumer pulsarSideConsumer = new KafkaConsumer(
+    new KafkaConsumerConfig("kafka:9092", "relay-pulsar-shopify"));
+PubSubPublisher pulsarPublisher = new PulsarPublisher(
+    new PulsarPublisherConfig("pulsar://pulsar:6650"));
+
+PubSubConsumer kinesisSideConsumer = new KafkaConsumer(
+    new KafkaConsumerConfig("kafka:9092", "relay-kinesis-shopify"));
+PubSubPublisher kinesisPublisher = new KinesisPublisher(
+    new KinesisPublisherConfig(Region.US_EAST_1, DefaultCredentialsProvider.create()));
+
+try (DataRelay relay = new DataRelay(cfg)) {
+  relay.register(
+      "pulsar-prod",       // destinationId  (no '.' allowed)
+      "shopify.orders",    // sourceTopic on the unified Kafka backbone
+      "shopify-orders",    // downstreamTopic on the destination broker
+      pulsarSideConsumer,
+      pulsarPublisher);
+
+  relay.register(
+      "kinesis-prod",
+      "shopify.orders",    // same backbone topic — fan-out to two destinations
+      "shopify-orders-stream",
+      kinesisSideConsumer,
+      kinesisPublisher);
+
+  relay.start();
+  // ... relay polls + republishes in the background ...
+}                          // close() shuts down workers, flushes + closes all
+```
+
+### Relay semantics
+
+1. **At-least-once delivery.** A backbone message is acked only after the
+   downstream publish has been confirmed within `publishTimeout`.
+   - If the **publish** times out or fails, the registration's poll loop
+     pauses on that message and retries the publish with `pollBackoff` until
+     it succeeds or `close()` is called. The consumer is not polled again
+     in the meantime, so its delivered/acked cursor stays contiguous and a
+     `KafkaConsumer` source won't strand the failed offset behind later,
+     successfully-published records that would become duplicates after
+     restart.
+   - If the consumer's **`acknowledge(...)`** throws (e.g. transient Kafka
+     `commitSync` during a rebalance, GCP ack-RPC), the relay logs and
+     continues processing the rest of the in-memory batch — every
+     remaining entry is already in our hands and any consumer wrapper that
+     tracks delivered offsets has already advanced past them, so dropping
+     them would block the commit watermark until restart. After the batch
+     ends, the outer poll loop runs `poll(...)`, which lets the consumer
+     make state-machine progress (in Kafka's case, complete the pending
+     rebalance, which is required before any commit can succeed).
+     `pollBackoff` is slept exactly once per batch so a burst of transient
+     ack failures during the same rebalance doesn't amplify backoff by
+     batch size. Messages that were already published but not yet acked
+     may be redelivered and re-published as duplicates (acceptable under
+     at-least-once). A transient ack failure no longer silently kills the
+     worker.
+2. **Layered provenance.** The relay stamps `relay.destinationId`,
+   `relay.sourceTopic`, and `relay.downstreamTopic` on every published message
+   (the keys are exposed as `RelayAttributes.RELAY_DESTINATION_ID` /
+   `_SOURCE_TOPIC` / `_DOWNSTREAM_TOPIC`). The `BridgeAttributes` provenance
+   set by an upstream `DataBridge` is **preserved unchanged**, so a downstream
+   consumer can recover the full path: original source → bridge channel →
+   relay destination.
+3. **Per-registration independence.** Each registration runs on its own poll
+   thread with its own consumer and publisher. A failing destination cannot
+   stall or starve other destinations; `poll()` failures back off via the
+   injected `Sleeper`.
+4. **Fan-out is first-class.** Registering the same backbone topic against
+   multiple `destinationId`s is supported — each destination gets its own
+   consumer (use distinct Kafka consumer group ids) and its own downstream
+   client, so progress is independent.
+5. **`destinationId` cannot contain `.`.** `destinationId` must match
+   `^[a-zA-Z0-9_-]+$`. The relay does not constrain `sourceTopic` or
+   `downstreamTopic` formats — downstream brokers (Pulsar, Kinesis, GCP, etc.)
+   have varied naming rules and the relay passes them through verbatim.
+6. **Single instance per registration.** Registering the same `PubSubConsumer`
+   or `PubSubPublisher` instance twice is rejected at `register()` time
+   (identity check). Build one of each per registration.
+
+`register(...)` must be called before `start()`, and `start()` is once-only.
+`close()` is synchronized and idempotent: it shuts down the per-registration
+executor (graceful `shutdownTimeout` then forced `closeForceTimeout`), flushes
+every publisher under a total wall-time budget of `closeForceTimeout` (so a
+publisher whose `flush()` would block forever on a stale in-flight future
+cannot bypass the shutdown budget), then closes every consumer and every
+publisher.
+
 ## Building from source
 
 ```bash
@@ -452,7 +599,7 @@ src/main/java/com/unifieddataprocessing/pubsub/
 ├── PublishBatchException.java         aggregate batch failure
 ├── PubSubPublisherStub.java           in-memory test double
 ├── PubSubConsumerStub.java            in-memory test double
-├── bridge/                            DataBridge + helpers
+├── bridge/                            DataBridge + helpers (Kafka fan-in)
 │   ├── DataBridge.java
 │   ├── DataBridgeConfig.java
 │   ├── Registration.java
@@ -461,6 +608,13 @@ src/main/java/com/unifieddataprocessing/pubsub/
 │   ├── MessageRewriter.java           stamps provenance attributes
 │   ├── ChannelOptions.java
 │   ├── NewTopicSpec.java
+│   └── Sleeper.java
+├── relay/                             DataRelay + helpers (Kafka fan-out)
+│   ├── DataRelay.java
+│   ├── DataRelayConfig.java
+│   ├── RelayRegistration.java
+│   ├── RelayAttributes.java           RELAY_DESTINATION_ID/_SOURCE_TOPIC/_DOWNSTREAM_TOPIC keys
+│   ├── RelayMessageRewriter.java      stamps relay provenance attributes
 │   └── Sleeper.java
 ├── kafka/                             KafkaProducer/Consumer + configs
 ├── msk/                               MSK IAM / SCRAM config factories
@@ -474,7 +628,9 @@ src/main/java/com/unifieddataprocessing/pubsub/
 Near-term follow-ups tracked in the issue tracker:
 
 - KCL-based Kinesis consumer for production resharding / lease management.
-- Kafka → external publisher relay (the downstream half of the bridge).
+- Apply the same unacked-bookkeeping cap to `DataRelay`'s backbone consumers.
+- RabbitMQ adapter (`PubSubPublisher` / `PubSubConsumer`), to round out the
+  set of brokers `DataRelay` can fan out to.
 
 ## License
 
