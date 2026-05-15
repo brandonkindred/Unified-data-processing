@@ -1,5 +1,6 @@
 package com.unifieddataprocessing.pubsub.schema;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -45,16 +46,19 @@ public final class JsonSchema implements Schema {
     }
 
     JsonNode root;
-    try {
-      root = MAPPER.readTree(payload);
+    try (JsonParser parser = MAPPER.getFactory().createParser(payload)) {
+      root = MAPPER.readTree(parser);
+      if (root == null || root.isMissingNode() || root.isNull()) {
+        throw new SchemaValidationException(topic, "non-JSON payload: empty document");
+      }
+      if (parser.nextToken() != null) {
+        throw new SchemaValidationException(
+            topic, "non-JSON payload: trailing content after JSON value");
+      }
     } catch (JsonProcessingException e) {
       throw new SchemaValidationException(topic, "non-JSON payload: " + e.getOriginalMessage());
     } catch (IOException e) {
       throw new SchemaValidationException(topic, "non-JSON payload: " + e.getMessage());
-    }
-
-    if (root == null || root.isMissingNode() || root.isNull()) {
-      throw new SchemaValidationException(topic, "non-JSON payload: empty document");
     }
 
     if (!root.isObject()) {

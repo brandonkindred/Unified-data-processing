@@ -120,6 +120,28 @@ class JsonSchemaTest {
   }
 
   @Test
+  void validate_trailingGarbageAfterValidObject_throws() {
+    JsonSchema schema = JsonSchema.builder().requireString("id").build();
+    Message m = message("{\"id\":\"a\"} trailing");
+
+    SchemaValidationException e =
+        assertThrows(SchemaValidationException.class, () -> schema.validate(m));
+    assertNull(e.fieldName());
+    assertTrue(e.reason().contains("non-JSON"), () -> "reason=" + e.reason());
+  }
+
+  @Test
+  void validate_concatenatedSecondObject_throws() {
+    JsonSchema schema = JsonSchema.builder().requireString("id").build();
+    Message m = message("{\"id\":\"a\"}{\"id\":\"b\"}");
+
+    SchemaValidationException e =
+        assertThrows(SchemaValidationException.class, () -> schema.validate(m));
+    assertNull(e.fieldName());
+    assertTrue(e.reason().contains("trailing"), () -> "reason=" + e.reason());
+  }
+
+  @Test
   void validate_extraFields_passes() {
     JsonSchema schema = JsonSchema.builder().requireString("a").build();
     Message m = message("{\"a\":\"x\",\"b\":99,\"c\":[1,2]}");
