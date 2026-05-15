@@ -18,6 +18,7 @@
         <google.cloud.pubsub.version>1.131.0</google.cloud.pubsub.version>
         <pulsar.version>3.3.1</pulsar.version>
         <aws.sdk.version>2.28.20</aws.sdk.version>
+        <jackson.version>2.15.4</jackson.version>
         <junit.version>5.10.2</junit.version>
         <mockito.version>5.11.0</mockito.version>
     </properties>
@@ -51,6 +52,12 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>kinesis</artifactId>
             <version>${aws.sdk.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
         </dependency>
 
         <dependency>
