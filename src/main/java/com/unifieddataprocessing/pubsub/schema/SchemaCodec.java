@@ -1,10 +1,12 @@
 package com.unifieddataprocessing.pubsub.schema;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.IOException;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -60,12 +62,20 @@ public final class SchemaCodec {
       throw new IllegalArgumentException("json must not be null");
     }
     JsonNode root;
-    try {
-      root = MAPPER.readTree(json);
+    try (JsonParser parser = MAPPER.getFactory().createParser(json)) {
+      root = MAPPER.readTree(parser);
+      if (root == null || root.isMissingNode()) {
+        throw new IllegalArgumentException("invalid JSON: empty document");
+      }
+      if (parser.nextToken() != null) {
+        throw new IllegalArgumentException("invalid JSON: trailing content after schema document");
+      }
     } catch (JsonProcessingException e) {
       throw new IllegalArgumentException("invalid JSON: " + e.getOriginalMessage(), e);
+    } catch (IOException e) {
+      throw new IllegalArgumentException("invalid JSON: " + e.getMessage(), e);
     }
-    if (root == null || !root.isObject()) {
+    if (!root.isObject()) {
       throw new IllegalArgumentException("schema must be a JSON object");
     }
     JsonNode fields = root.get(REQUIRED_FIELDS);

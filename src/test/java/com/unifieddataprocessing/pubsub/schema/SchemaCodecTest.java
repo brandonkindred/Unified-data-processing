@@ -117,6 +117,23 @@ class SchemaCodecTest {
   }
 
   @Test
+  void fromJson_trailingContent_rejected() {
+    String json =
+        "{\"requiredFields\":[]} {\"requiredFields\":[{\"name\":\"x\",\"type\":\"STRING\"}]}";
+
+    IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, () -> SchemaCodec.fromJson(json));
+    assertTrue(e.getMessage().contains("trailing"), () -> "message=" + e.getMessage());
+  }
+
+  @Test
+  void fromJson_trailingGarbage_rejected() {
+    String json = "{\"requiredFields\":[]} garbage";
+
+    assertThrows(IllegalArgumentException.class, () -> SchemaCodec.fromJson(json));
+  }
+
+  @Test
   void fromJson_nonObjectRoot_rejected() {
     IllegalArgumentException e =
         assertThrows(
