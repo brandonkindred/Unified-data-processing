@@ -94,8 +94,8 @@ public final class SchemaCodec {
       }
       JsonNode nameNode = field.get(NAME);
       JsonNode typeNode = field.get(TYPE);
-      if (nameNode == null || !nameNode.isTextual()) {
-        throw new IllegalArgumentException("requiredFields entry missing textual 'name'");
+      if (nameNode == null || !nameNode.isTextual() || nameNode.asText().isBlank()) {
+        throw new IllegalArgumentException("requiredFields entry missing non-blank 'name'");
       }
       if (typeNode == null || !typeNode.isTextual()) {
         throw new IllegalArgumentException("requiredFields entry missing textual 'type'");
@@ -112,23 +112,12 @@ public final class SchemaCodec {
         throw new IllegalArgumentException("unknown field type: " + typeText, e);
       }
       switch (type) {
-        case STRING:
-          builder.requireString(name);
-          break;
-        case NUMBER:
-          builder.requireNumber(name);
-          break;
-        case BOOLEAN:
-          builder.requireBoolean(name);
-          break;
-        case OBJECT:
-          builder.requireObject(name);
-          break;
-        case ARRAY:
-          builder.requireArray(name);
-          break;
-        default:
-          throw new IllegalArgumentException("unhandled field type: " + type);
+        case STRING -> builder.requireString(name);
+        case NUMBER -> builder.requireNumber(name);
+        case BOOLEAN -> builder.requireBoolean(name);
+        case OBJECT -> builder.requireObject(name);
+        case ARRAY -> builder.requireArray(name);
+        default -> throw new IllegalArgumentException("unhandled field type: " + type);
       }
     }
     return builder.build();

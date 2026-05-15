@@ -161,6 +161,78 @@ class SchemaCodecTest {
   }
 
   @Test
+  void fromJson_blankName_rejected() {
+    String emptyName = "{\"requiredFields\":[{\"name\":\"\",\"type\":\"STRING\"}]}";
+    IllegalArgumentException empty =
+        assertThrows(IllegalArgumentException.class, () -> SchemaCodec.fromJson(emptyName));
+    assertTrue(empty.getMessage().contains("non-blank"), () -> "message=" + empty.getMessage());
+
+    IllegalArgumentException whitespace =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                SchemaCodec.fromJson(
+                    "{\"requiredFields\":[{\"name\":\"   \",\"type\":\"STRING\"}]}"));
+    assertTrue(
+        whitespace.getMessage().contains("non-blank"), () -> "message=" + whitespace.getMessage());
+  }
+
+  @Test
+  void fromJson_typeNotTextual_rejected() {
+    IllegalArgumentException numeric =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> SchemaCodec.fromJson("{\"requiredFields\":[{\"name\":\"x\",\"type\":42}]}"));
+    assertTrue(numeric.getMessage().contains("type"), () -> "message=" + numeric.getMessage());
+
+    IllegalArgumentException nullValue =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> SchemaCodec.fromJson("{\"requiredFields\":[{\"name\":\"x\",\"type\":null}]}"));
+    assertTrue(nullValue.getMessage().contains("type"), () -> "message=" + nullValue.getMessage());
+  }
+
+  @Test
+  void fromJson_typeLowercase_rejected() {
+    String json = "{\"requiredFields\":[{\"name\":\"x\",\"type\":\"string\"}]}";
+
+    IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, () -> SchemaCodec.fromJson(json));
+    assertTrue(e.getMessage().contains("unknown field type"), () -> "message=" + e.getMessage());
+    assertTrue(e.getMessage().contains("string"), () -> "message=" + e.getMessage());
+  }
+
+  @Test
+  void toJson_allFieldTypes_emitsEnumNames() {
+    JsonSchema schema =
+        JsonSchema.builder()
+            .requireString("s")
+            .requireNumber("n")
+            .requireBoolean("b")
+            .requireObject("o")
+            .requireArray("a")
+            .build();
+
+    String json = SchemaCodec.toJson(schema);
+
+    assertEquals(
+        "{\"requiredFields\":["
+            + "{\"name\":\"s\",\"type\":\"STRING\"},"
+            + "{\"name\":\"n\",\"type\":\"NUMBER\"},"
+            + "{\"name\":\"b\",\"type\":\"BOOLEAN\"},"
+            + "{\"name\":\"o\",\"type\":\"OBJECT\"},"
+            + "{\"name\":\"a\",\"type\":\"ARRAY\"}]}",
+        json);
+
+    JsonSchema decoded = SchemaCodec.fromJson(json);
+    assertEquals(JsonFieldType.STRING, decoded.requiredFields().get("s"));
+    assertEquals(JsonFieldType.NUMBER, decoded.requiredFields().get("n"));
+    assertEquals(JsonFieldType.BOOLEAN, decoded.requiredFields().get("b"));
+    assertEquals(JsonFieldType.OBJECT, decoded.requiredFields().get("o"));
+    assertEquals(JsonFieldType.ARRAY, decoded.requiredFields().get("a"));
+  }
+
+  @Test
   void toJson_nullSchema_rejected() {
     assertThrows(IllegalArgumentException.class, () -> SchemaCodec.toJson(null));
   }
